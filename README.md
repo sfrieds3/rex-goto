@@ -29,6 +29,8 @@ Fuzzy-search every pane in [Rex](https://www.superlogical.com/rex) at once. rex-
 - Ctrl-R narrows the scope to this host, this session or this window (host only shows up when you search other hosts); Ctrl-S narrows the source to scrollback, agent transcripts, or just what you asked, what the agent replied, or its tool calls and results. The list reloads in place.
 - A line repeated in a pane, like a prompt or a progress line, shows once, at its newest copy. The preview and the editor still show every copy.
 - Tab selects lines, and Ctrl-Y copies every selected line, in the order you picked them.
+- Alt-T lists every session and tab; pick one to search only it, or `all` to search everything again. The prompt shows what you picked.
+- Alt-R collects every pane again without closing the picker, for output that arrived since it opened. The list keeps its rows until the new ones are in.
 
 ## Requirements
 
@@ -67,9 +69,12 @@ Then run `rex config reload`. The action also shows up in the command palette as
 | Ctrl-R | next scope: all, host, session, window |
 | Ctrl-S | next source: all, scroll, agent, user, assistant, tool |
 | Alt-L | search labels too, or only the text again |
+| Alt-T | pick a session or tab to search, or leave the list |
+| Alt-R | collect every pane again |
 | Shift-Up/Down | scroll the preview |
 | Ctrl-/ | toggle the preview |
-| Esc, Ctrl-C | cancel |
+| Esc | leave the session and tab list, or cancel |
+| Ctrl-C | cancel |
 
 fzf's search syntax works as usual: start a term with `'` for an exact match, or `^`/`$` to anchor it. Enter, Alt-Enter and Ctrl-O act on the line under the cursor even when others are selected.
 

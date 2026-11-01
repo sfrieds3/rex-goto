@@ -5,6 +5,10 @@ usage: rex_goto.py [options] SESSION BLOCK     # the picker; SESSION and BLOCK a
        rex_goto.py rows DIR                     # fzf reload: the rows for the current scope and source
        rex_goto.py cycle DIR scope|source|fields  # fzf transform: next scope, source or searched fields
        rex_goto.py preview DIR BUFFER LINE      # fzf preview: BUFFER with LINE marked
+       rex_goto.py choose DIR                   # fzf transform: list the sessions and tabs to narrow to
+       rex_goto.py accept DIR KEY ROW           # fzf transform: end the picker, or pick from the list
+       rex_goto.py refresh DIR                  # fzf reload: collect every pane again
+       rex_goto.py cancel DIR | prompt DIR      # fzf transforms: Esc, and the prompt for the state
 """
 
 import argparse
@@ -50,6 +54,8 @@ KEYS = (
     ("ctrl-r", "scope"),
     ("ctrl-s", "source"),
     ("alt-l", "search labels"),
+    ("alt-t", "pick session/tab"),
+    ("alt-r", "refresh"),
     ("shift-up/down", "scroll preview"),
     ("ctrl-/", "preview"),
 )
@@ -589,6 +595,14 @@ def transcripts_for(agents):
     return assign_transcripts([agent for agent in agents if agent])
 
 
+def chosen(pane, only):
+    """Whether PANE is in the session or tab ONLY names, by server, session_id and, for a tab, window_id."""
+    if not only:
+        return True
+    keys = [key for key in ("server", "session_id", "window_id") if key in only]
+    return bool(pane) and all(pane.get(key, "") == only[key] for key in keys)
+
+
 def scopes_for(hosts):
     """The scopes Ctrl-R cycles through: host only means something when another server is searched."""
     return list(SCOPES) if names(hosts) not in ([], [LOCAL]) else [scope for scope in SCOPES if scope != "host"]
@@ -603,6 +617,9 @@ def initial_state(options=None):
         "source": getattr(options, "source", "all"),
         "fields": "text",
         "scopes": scopes,
+        # The session or tab picked from Alt-T's list, if any, and whether the list is showing.
+        "only": None,
+        "choosing": False,
     }
 
 
@@ -624,23 +641,125 @@ def split_row(row):
     return row.rstrip("\n").split("\t", 5)
 
 
-def keep(row, state):
-    _, _, proximity, kind, _, _ = split_row(row)
+def keep(row, state, panes=None):
+    """Whether the row is in the state's scope and source, and its pane, from PANES by buffer, in the chosen one."""
+    buffer, _, proximity, kind, _, _ = split_row(row)
     source, _, role = kind.partition(":")
-    return int(proximity) <= SCOPE_LIMIT[state["scope"]] and state["source"] in ("all", source, role)
+    in_scope = int(proximity) <= SCOPE_LIMIT[state["scope"]] and state["source"] in ("all", source, role)
+    return in_scope and chosen((panes or {}).get(buffer), state.get("only"))
 
 
 def prompt(state):
+    if state.get("choosing"):
+        return "session or tab> "
     marker = "+label" if state["fields"] == "label" else ""
-    return f"{state['scope']}/{state['source']}{marker}> "
+    only = f"{state['only']['name']} " if state.get("only") else ""
+    return f"{only}{state['scope']}/{state['source']}{marker}> "
+
+
+def read_pane(directory, buffer):
+    """The pane of buffer BUFFER, from the ID.json build writes next to it, or None."""
+    try:
+        with open(os.path.join(directory, f"{int(buffer)}.json"), encoding="utf-8") as source:
+            return json.load(source)["pane"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def read_panes(directory):
+    """Each buffer's pane, by buffer ID."""
+    stems = (name[: -len(".json")] for name in os.listdir(directory) if name.endswith(".json"))
+    return {stem: read_pane(directory, stem) for stem in stems if stem.isdigit()}
 
 
 def cmd_rows(directory):
     state = read_state(directory)
+    panes = read_panes(directory) if state.get("only") else None
     with open(os.path.join(directory, "rows.tsv"), encoding="utf-8") as source:
         for row in source:
-            if keep(row, state):
+            if keep(row, state, panes):
                 sys.stdout.write(row)
+
+
+# Alt-T's list has a row per session and tab, in the same six fields, so fzf shows and searches it alike.
+CHOICE = "choice"
+
+
+def choices(directory):
+    """Every session and tab that has a pane in the picker, nearest first: (label, name, filter)."""
+    found = {"all": ("all", "every session and tab", None)}
+    for pane in sorted((p for p in read_panes(directory).values() if p), key=lambda p: p.get("proximity", OTHER)):
+        server = pane.get("server", "")
+        host = f"{pane['host']}/" if pane.get("host") else ""
+        session = f"{host}{pane['session']}"
+        found.setdefault(
+            ("session", server, pane["session_id"]),
+            ("session", session, {"server": server, "session_id": pane["session_id"], "name": session}),
+        )
+        tab = f"{session}:{pane['window']}"
+        tab_label = f" {pane['window_label']}" if pane.get("window_label") else ""
+        found.setdefault(
+            ("tab", server, pane["session_id"], pane.get("window_id", "")),
+            (
+                "tab",
+                f"{tab}{tab_label}",
+                {
+                    "server": server,
+                    "session_id": pane["session_id"],
+                    "window_id": pane.get("window_id", ""),
+                    "name": tab,
+                },
+            ),
+        )
+    return list(found.values())
+
+
+def cmd_choose(directory, out=sys.stdout):
+    """Alt-T: the session and tab list in place of the rows, or from the list, back to the rows as they were."""
+    state = read_state(directory)
+    if state["choosing"]:
+        return back(directory, state, out)
+    rows, state["choices"] = [], {}
+    for index, (label, name, choice) in enumerate(choices(directory)):
+        rows.append("\t".join((CHOICE, str(index), str(BLOCK), CHOICE, label, name)))
+        state["choices"][str(index)] = choice
+    with open(os.path.join(directory, "choices.tsv"), "w", encoding="utf-8") as list_out:
+        list_out.writelines(row + "\n" for row in rows)
+    state["choosing"] = True
+    write_state(directory, state)
+    list_path = shlex.quote(os.path.join(directory, "choices.tsv"))
+    out.write(f"hide-preview+clear-query+clear-multi+change-prompt({prompt(state)})+reload:cat {list_path}\n")
+
+
+def back(directory, state, out, choice=None, picked=False):
+    """From the list back to the rows: narrowed to CHOICE if PICKED, else as they were."""
+    if picked:
+        state["only"] = choice
+    state["choosing"] = False
+    state.pop("choices", None)
+    write_state(directory, state)
+    out.write(f"show-preview+clear-query+change-prompt({prompt(state)})+reload:{self_command('rows', directory)}\n")
+
+
+def cmd_accept(directory, key, row, out=sys.stdout):
+    """An accept key: ends the picker, printing KEY first as --expect would, or in the list, picks its row."""
+    state = read_state(directory)
+    if not state["choosing"]:
+        # Only copy uses the selection; the rest act on the line under the cursor.
+        out.write(f"{'' if key == 'ctrl-y' else 'clear-multi+'}print({key})+accept\n")
+        return
+    fields = split_row(row) if row else []
+    if key != "enter" or len(fields) < 2 or fields[0] != CHOICE:
+        return back(directory, state, out)
+    return back(directory, state, out, state.get("choices", {}).get(fields[1]), picked=True)
+
+
+def cmd_cancel(directory, out=sys.stdout):
+    """Esc: leaves the session and tab list, or else the picker."""
+    state = read_state(directory)
+    if state["choosing"]:
+        return back(directory, state, out)
+    out.write("abort\n")
 
 
 CYCLES = {"scope": SCOPES, "source": SOURCES, "fields": FIELDS}
@@ -648,6 +767,9 @@ CYCLES = {"scope": SCOPES, "source": SOURCES, "fields": FIELDS}
 
 def cmd_cycle(directory, what):
     state = read_state(directory)
+    if state["choosing"]:
+        # The list isn't scoped, so the cycle keys wait until it's gone.
+        return
     values = state["scopes"] if what == "scope" else CYCLES[what]
     state[what] = values[(values.index(state[what]) + 1) % len(values)]
     write_state(directory, state)
@@ -701,11 +823,19 @@ def fzf_command(options, directory):
         f"--preview-window={options.preview_window},~1,+{{2}}+1/2",
         # Binds rather than --expect, which can't share a key with a bind. Only ctrl-y copies the selection;
         # the rest act on the line under the cursor.
-        *(f"--bind={key}:{'' if key == 'ctrl-y' else 'clear-multi+'}print({key})+accept" for key in ACCEPT_KEYS),
+        # In the session and tab list, the accept keys pick from it instead, so a transform decides.
+        *(f"--bind={key}:transform:{self_command('accept', directory, key)} {{}}" for key in ACCEPT_KEYS),
         f"--bind=multi:transform-footer:{SELECTED_FOOTER}",
         f"--bind=ctrl-r:transform:{self_command('cycle', directory, 'scope')}",
         f"--bind=ctrl-s:transform:{self_command('cycle', directory, 'source')}",
         f"--bind=alt-l:transform:{self_command('cycle', directory, 'fields')}",
+        f"--bind=alt-t:transform:{self_command('choose', directory)}",
+        # Keeps the old rows until the new ones are all in, so the list never goes empty while it waits.
+        f"--bind=esc:transform:{self_command('cancel', directory)}",
+        # reload-sync keeps the old rows until the new ones are all in, so the list never goes empty while it waits.
+        f"--bind=alt-r:change-prompt(refreshing> )+reload-sync:{self_command('refresh', directory)}",
+        # Each load ends with the prompt the state calls for, which puts it back after a refresh.
+        f"--bind=load:transform-prompt:{self_command('prompt', directory)}",
         "--bind=ctrl-/:toggle-preview",
     ]
 
@@ -739,11 +869,54 @@ def fzf_env(options):
     return env
 
 
+def collect(directory, options, out):
+    """Collects every pane into DIRECTORY, writing all its rows to rows.tsv and those the state keeps to OUT."""
+    state = read_state(directory)
+    path = os.path.join(directory, "rows.tsv")
+    panes = {}
+    with open(path + ".new", "w", encoding="utf-8") as rows:
+        found = terminal_blocks(options.session, options.block, options.hosts, options.sessions, options.windows)
+        chunks = build(directory, found, options.max_lines, options.transcripts, options.dedupe)
+        with contextlib.closing(chunks):
+            for chunk in chunks:
+                if state.get("only"):
+                    # A chunk's buffers, and so their panes, are written before it comes out.
+                    for buffer in {split_row(row)[0] for row in chunk} - panes.keys():
+                        panes[buffer] = read_pane(directory, buffer)
+                rows.writelines(row + "\n" for row in chunk)
+                out.writelines(row + "\n" for row in chunk if keep(row, state, panes))
+                out.flush()
+    # The rows and the list read rows.tsv while a refresh runs, so it's swapped in whole.
+    os.replace(path + ".new", path)
+
+
+def cmd_refresh(directory, out=sys.stdout):
+    """Alt-R: collects every pane again, with the picker's options, for fzf to reload."""
+    if read_state(directory)["choosing"]:
+        # In the list, it leaves the list as it is.
+        with open(os.path.join(directory, "choices.tsv"), encoding="utf-8") as source:
+            out.write(source.read())
+        return
+    with open(os.path.join(directory, "options.json"), encoding="utf-8") as source:
+        options = argparse.Namespace(**json.load(source))
+    # A pane that's gone takes its buffers with it.
+    for name in os.listdir(directory):
+        stem, _, extension = name.partition(".")
+        if stem.isdigit() and extension in ("txt", "json"):
+            os.remove(os.path.join(directory, name))
+    collect(directory, options, out)
+
+
+def cmd_prompt(directory, out=sys.stdout):
+    out.write(prompt(read_state(directory)) + "\n")
+
+
 def pick(options):
     directory = tempfile.mkdtemp(prefix="rex-goto-")
     try:
         write_state(directory, initial_state(options))
-        state = read_state(directory)
+        with open(os.path.join(directory, "options.json"), "w", encoding="utf-8") as out:
+            json.dump(vars(options), out)
         # fzf opens first and shows its spinner while the rows come in.
         fzf = subprocess.Popen(
             fzf_command(options, directory),
@@ -753,16 +926,7 @@ def pick(options):
             env=fzf_env(options),
         )
         try:
-            with open(os.path.join(directory, "rows.tsv"), "w", encoding="utf-8") as rows:
-                panes = terminal_blocks(
-                    options.session, options.block, options.hosts, options.sessions, options.windows
-                )
-                chunks = build(directory, panes, options.max_lines, options.transcripts, options.dedupe)
-                with contextlib.closing(chunks):
-                    for chunk in chunks:
-                        rows.writelines(row + "\n" for row in chunk)
-                        fzf.stdin.writelines(row + "\n" for row in chunk if keep(row, state))
-                        fzf.stdin.flush()
+            collect(directory, options, fzf.stdin)
         except BrokenPipeError:
             pass
         except BaseException:
@@ -785,8 +949,9 @@ def pick(options):
             copy("\n".join(split_row(row)[5] for row in rows), options.clip_tool)
             return 0
         buffer, line, _, _, _, _ = split_row(rows[0])
-        with open(os.path.join(directory, f"{int(buffer)}.json"), encoding="utf-8") as source:
-            pane = json.load(source)["pane"]
+        pane = read_pane(directory, buffer)
+        if pane is None:
+            raise RuntimeError(f"no pane for buffer {buffer}")
         if key in ("alt-enter", "ctrl-o"):
             go_to(pane, options.client)
         else:
@@ -835,6 +1000,16 @@ def main(argv=None):
         return cmd_cycle(argv[1], argv[2]) or 0
     if command == "preview" and len(argv) == 4:
         return cmd_preview(*argv[1:]) or 0
+    if command == "choose" and len(argv) == 2:
+        return cmd_choose(argv[1]) or 0
+    if command == "accept" and len(argv) in (3, 4) and argv[2] in ACCEPT_KEYS:
+        return cmd_accept(argv[1], argv[2], argv[3] if len(argv) == 4 else "") or 0
+    if command == "cancel" and len(argv) == 2:
+        return cmd_cancel(argv[1]) or 0
+    if command == "refresh" and len(argv) == 2:
+        return cmd_refresh(argv[1]) or 0
+    if command == "prompt" and len(argv) == 2:
+        return cmd_prompt(argv[1]) or 0
     options = parse_args(argv)
     try:
         return pick(options)
