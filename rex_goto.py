@@ -24,7 +24,9 @@ REX = os.environ.get("REX_BIN") or "rex"
 TIMEOUT = os.environ.get("REX_GOTO_TIMEOUT", "2s")
 TERMINAL = "com.superlogical.terminal"
 SCOPES = ("all", "session", "window")
-SOURCES = ("all", "scroll", "agent")
+# A transcript's lines also narrow by role: what you asked, what the agent said, and its tool calls and results.
+ROLES = ("user", "assistant", "tool")
+SOURCES = ("all", "scroll", "agent", *ROLES)
 # What fzf matches: the line's text, or its label too. The values are --nth over --with-nth's two fields.
 FIELDS = ("text", "label")
 NTH = {"text": "2", "label": "1.."}
@@ -336,14 +338,20 @@ def compact(value):
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 
 
-def render(agent, records):
-    """A transcript as plain lines: a ▌ heading per turn, tool call or tool result, then its text."""
+def render(agent, records, roles=None):
+    """A transcript as plain lines: a ▌ heading per turn, tool call or tool result, then its text.
+
+    Given a list, ROLES gets each line's role in step: user, assistant, or tool for tool calls and results.
+    """
     lines = []
 
     def turn(heading, body, limit=None):
         body = clip(body, limit) if limit else str(body).splitlines()
         if any(line.strip() for line in body):
             lines.extend([f"▌ {heading}", *body, ""])
+            if roles is not None:
+                role = heading if heading in ("user", "assistant") else "tool"
+                roles.extend([role] * (len(body) + 2))
 
     for record in records:
         if not isinstance(record, dict):
@@ -396,22 +404,32 @@ def clean(line):
     return line.rstrip("\r").replace("\t", "    ")
 
 
-def write_buffers(directory, buffers):
+def write_buffers(directory, buffers, dedupe=True):
     """Writes each buffer, ID.txt, and its pane, ID.json, then yields its rows, newest line first:
-    buffer, line, proximity, source, label, text. fzf searches only the text."""
+    buffer, line, proximity, source, label, text. fzf searches only the text.
+
+    A transcript line's source is agent:ROLE. With DEDUPE, a line repeated in a buffer gets one row, at its newest
+    copy; the buffer itself keeps every line, so the preview and the editor still show them all.
+    """
     for buffer in buffers:
         lines = [clean(line) for line in buffer["lines"]]
+        roles = buffer.get("roles")
         with open(os.path.join(directory, f"{buffer['id']}.txt"), "w", encoding="utf-8") as out:
             out.write(buffer["title"] + "\n")
             out.write("\n".join(lines) + "\n")
         with open(os.path.join(directory, f"{buffer['id']}.json"), "w", encoding="utf-8") as out:
             json.dump({"pane": buffer["pane"], "kind": buffer["kind"]}, out)
+        seen = set()
         for number in range(len(lines), 0, -1):
             text = lines[number - 1]
-            if text.strip():
-                yield "\t".join(
-                    (str(buffer["id"]), str(number), str(buffer["proximity"]), buffer["kind"], buffer["label"], text)
-                )
+            if not text.strip():
+                continue
+            kind = f"{buffer['kind']}:{roles[number - 1]}" if roles else buffer["kind"]
+            if dedupe:
+                if (kind, text) in seen:
+                    continue
+                seen.add((kind, text))
+            yield "\t".join((str(buffer["id"]), str(number), str(buffer["proximity"]), kind, buffer["label"], text))
 
 
 def label_for(pane, source):
@@ -439,7 +457,7 @@ def pane_title(pane, source):
     return f"{pane['session']} · window {pane['window']}{window} · {source} · {pane['block_id']}"
 
 
-def build(directory, panes, max_lines, transcripts=True):
+def build(directory, panes, max_lines, transcripts=True, dedupe=True):
     """Writes each pane's buffers and yields their rows, one list per pane, nearest pane first.
 
     Every rex call starts at once, and a pane's rows go out as soon as its scrollback is in. Matching transcripts
@@ -469,18 +487,21 @@ def build(directory, panes, max_lines, transcripts=True):
                 found = transcripts_for([future.result() if future else None for future in agents])
             path = found.get(index) if agent else None
             if path:
+                roles = []
+                lines = render(agent["agent"], read_records(path), roles)
                 buffers.append(
                     {
                         "kind": "agent",
                         "label": label_for(pane, agent["agent"]),
                         "title": f"{pane_title(pane, agent['agent'])} · {path}",
-                        "lines": render(agent["agent"], read_records(path))[-max_lines:],
+                        "lines": lines[-max_lines:],
+                        "roles": roles[-max_lines:],
                     }
                 )
             for buffer in buffers:
                 buffer.update(id=next_id, pane=pane, proximity=pane["proximity"], label=buffer["label"].ljust(width))
                 next_id += 1
-            yield list(write_buffers(directory, buffers))
+            yield list(write_buffers(directory, buffers, dedupe))
     finally:
         # A picker closed early shouldn't wait for the calls still running.
         pool.shutdown(wait=False, cancel_futures=True)
@@ -523,7 +544,8 @@ def split_row(row):
 
 def keep(row, state):
     _, _, proximity, kind, _, _ = split_row(row)
-    return int(proximity) <= SCOPE_LIMIT[state["scope"]] and state["source"] in ("all", kind)
+    source, _, role = kind.partition(":")
+    return int(proximity) <= SCOPE_LIMIT[state["scope"]] and state["source"] in ("all", source, role)
 
 
 def prompt(state):
@@ -651,7 +673,8 @@ def pick(options):
         try:
             with open(os.path.join(directory, "rows.tsv"), "w", encoding="utf-8") as rows:
                 panes = terminal_blocks(options.session, options.block)
-                with contextlib.closing(build(directory, panes, options.max_lines, options.transcripts)) as chunks:
+                chunks = build(directory, panes, options.max_lines, options.transcripts, options.dedupe)
+                with contextlib.closing(chunks):
                     for chunk in chunks:
                         rows.writelines(row + "\n" for row in chunk)
                         fzf.stdin.writelines(row + "\n" for row in chunk if keep(row, state))
@@ -702,6 +725,7 @@ def parse_args(argv):
     parser.add_argument("--source", choices=SOURCES, default="all")
     parser.add_argument("--max-lines", type=int, default=20000, help="newest lines kept per buffer")
     parser.add_argument("--transcripts", type=boolean, default=True, help="search agent transcripts too")
+    parser.add_argument("--dedupe", type=boolean, default=True, help="one row per repeated line in a buffer")
     parser.add_argument("--editor", default=os.environ.get("REX_GOTO_EDITOR") or "nvim -R")
     parser.add_argument("--clip-tool", default="")
     parser.add_argument("--fzf-tool", default="fzf")

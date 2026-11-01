@@ -26,7 +26,8 @@ Fuzzy-search every pane in [Rex](https://www.superlogical.com/rex) at once. rex-
 - Agent panes also get their transcript: user and assistant turns, tool calls and tool results (each result clipped to 200 lines), so you can find what scrolled away or never showed on screen.
 - Rows start with the pane the picker opened from, then its window, its session, and the rest; within a pane, the newest line comes first. fzf matches only the line's text until Alt-L adds the `session:window source` label, so `ops:2 trace` finds a traceback in tab 2 of `ops`.
 - The preview shows the whole buffer with line numbers and the match in reverse video, centred. Shift-Up/Down scroll it.
-- Ctrl-R narrows the scope to this session or this window; Ctrl-S narrows the source to scrollback or agent transcripts. The list reloads in place.
+- Ctrl-R narrows the scope to this session or this window; Ctrl-S narrows the source to scrollback, agent transcripts, or just what you asked, what the agent replied, or its tool calls and results. The list reloads in place.
+- A line repeated in a pane, like a prompt or a progress line, shows once, at its newest copy. The preview and the editor still show every copy.
 - Tab selects lines, and Ctrl-Y copies every selected line, in the order you picked them.
 
 ## Requirements
@@ -64,7 +65,7 @@ Then run `rex config reload`. The action also shows up in the command palette as
 | Tab, Shift-Tab | select or unselect the line |
 | Ctrl-Y | copy the selected lines, or the line under the cursor |
 | Ctrl-R | next scope: all, session, window |
-| Ctrl-S | next source: all, scroll, agent |
+| Ctrl-S | next source: all, scroll, agent, user, assistant, tool |
 | Alt-L | search labels too, or only the text again |
 | Shift-Up/Down | scroll the preview |
 | Ctrl-/ | toggle the preview |
@@ -102,9 +103,10 @@ require("rex_goto").setup({
 | `python` | `python3` | Interpreter for `rex_goto.py`. |
 | `bounds` | `{ 0.05, 0.05, 0.9, 0.9 }` | Layer position and size as fractions of the window: x, y, width, height. |
 | `scope` | `all` | Starting scope: `all`, `session` or `window`. |
-| `source` | `all` | Starting source: `all`, `scroll` or `agent`. |
+| `source` | `all` | Starting source: `all`, `scroll`, `agent`, or a transcript role: `user`, `assistant` or `tool`. |
 | `max_lines` | `20000` | Newest lines kept per buffer. |
 | `transcripts` | `true` | Search agent transcripts. `false` searches scrollback only. |
+| `dedupe` | `true` | Show a line repeated in a buffer once, at its newest copy. `false` shows every copy. |
 | `editor` | `nvim -R` | Command Enter runs as `editor +LINE FILE`. `$REX_GOTO_EDITOR` changes the default. |
 | `clip_tool` | | Copy command. Without it, `pbcopy`, then `wl-copy` (with `WAYLAND_DISPLAY`) or `xclip` (with `DISPLAY`), else OSC 52. |
 | `fzf_tool` | `fzf` | fzf command. |
