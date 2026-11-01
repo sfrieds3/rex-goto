@@ -24,15 +24,16 @@ Fuzzy-search every pane in [Rex](https://www.superlogical.com/rex) at once. rex-
 
 - Searches every placed terminal pane in every Rex session. Floating layers, this picker's among them, are left out.
 - Agent panes also get their transcript: user and assistant turns, tool calls and tool results (each result clipped to 200 lines), so you can find what scrolled away or never showed on screen.
-- Rows start with the pane the picker opened from, then its window, its session, and the rest; within a pane, the newest line comes first. fzf matches only the line's text, not the `session:window source` label.
+- Rows start with the pane the picker opened from, then its window, its session, and the rest; within a pane, the newest line comes first. fzf matches only the line's text until Alt-L adds the `session:window source` label, so `ops:2 trace` finds a traceback in tab 2 of `ops`.
 - The preview shows the whole buffer with line numbers and the match in reverse video, centred. Shift-Up/Down scroll it.
 - Ctrl-R narrows the scope to this session or this window; Ctrl-S narrows the source to scrollback or agent transcripts. The list reloads in place.
+- Tab selects lines, and Ctrl-Y copies every selected line, in the order you picked them.
 
 ## Requirements
 
 - Rex with Lua configuration (`~/.config/rex/init.lua`)
 - Python 3.10 or newer (standard library only)
-- [fzf](https://github.com/junegunn/fzf) 0.45 or newer (for `transform`) and `rex` on the pane's `PATH` (Rex adds `rex` to the panes it starts)
+- [fzf](https://github.com/junegunn/fzf) 0.63 or newer (for `change-nth`, `print` and the footer) and `rex` on the pane's `PATH` (Rex adds `rex` to the panes it starts)
 
 ## Install
 
@@ -60,14 +61,16 @@ Then run `rex config reload`. The action also shows up in the command palette as
 | --- | --- |
 | Enter | open the buffer at the matching line in `editor` (`nvim -R`), inside the layer |
 | Alt-Enter, Ctrl-O | go to the pane: show its session and window, and focus it |
-| Ctrl-Y | copy the line |
+| Tab, Shift-Tab | select or unselect the line |
+| Ctrl-Y | copy the selected lines, or the line under the cursor |
 | Ctrl-R | next scope: all, session, window |
 | Ctrl-S | next source: all, scroll, agent |
+| Alt-L | search labels too, or only the text again |
 | Shift-Up/Down | scroll the preview |
 | Ctrl-/ | toggle the preview |
 | Esc, Ctrl-C | cancel |
 
-fzf's search syntax works as usual: start a term with `'` for an exact match, or `^`/`$` to anchor it.
+fzf's search syntax works as usual: start a term with `'` for an exact match, or `^`/`$` to anchor it. Enter, Alt-Enter and Ctrl-O act on the line under the cursor even when others are selected.
 
 ### Which transcript belongs to a pane
 
