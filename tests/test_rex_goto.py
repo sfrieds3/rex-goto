@@ -699,14 +699,149 @@ class PickTests(unittest.TestCase):
         self.assertIn("--nth=2", args)
         self.assertIn("--multi", args)
         self.assertFalse(any(arg.startswith("--expect") for arg in args), "--expect can't share keys with binds")
-        # Every accept key prints its name first, as --expect did; only copy keeps the selection.
-        self.assertIn("--bind=enter:clear-multi+print(enter)+accept", args)
-        self.assertIn("--bind=ctrl-o:clear-multi+print(ctrl-o)+accept", args)
-        self.assertIn("--bind=ctrl-y:print(ctrl-y)+accept", args)
+        # Each accept key asks `accept`, which prints the key first, as --expect did, or picks from the list.
+        for key in rex_goto.ACCEPT_KEYS:
+            self.assertTrue(any(arg.startswith(f"--bind={key}:transform:") and " accept " in arg for arg in args))
+        self.assertTrue(any(arg.startswith("--bind=alt-r:change-prompt(refreshing> )+reload-sync:") for arg in args))
         header = next(arg for arg in args if arg.startswith("--header="))
         for key, _ in rex_goto.KEYS:
             self.assertIn(key, header)
         self.assertTrue(any(arg.startswith("--preview-window=") and arg.endswith(",~1,+{2}+1/2") for arg in args))
+
+
+class ChooseTests(unittest.TestCase):
+    """Alt-T's session and tab list, the accept keys around it, and Alt-R, against buffers on disk."""
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        panes = [
+            {**pane("dev", "b1", rex_goto.BLOCK), "window_label": "edit"},
+            pane("dev", "b2", rex_goto.SESSION, window=2),
+            {**pane("dev", "b9"), "server": "studio", "host": "studio"},
+        ]
+        buffers = [
+            {"id": index, "pane": p, "kind": "scroll", "label": "l", "title": "t", "lines": [p["block_id"] + " line"]}
+            for index, p in enumerate(panes)
+        ]
+        for buffer in buffers:
+            buffer["proximity"] = buffer["pane"]["proximity"]
+        rows = list(rex_goto.write_buffers(self.directory, buffers))
+        with open(os.path.join(self.directory, "rows.tsv"), "w") as out:
+            out.writelines(row + "\n" for row in rows)
+        rex_goto.write_state(self.directory, rex_goto.initial_state())
+
+    def call(self, function, *args):
+        out = io.StringIO()
+        function(self.directory, *args, out)
+        return out.getvalue().strip()
+
+    def rows(self):
+        with mock.patch("sys.stdout", new=io.StringIO()) as out:
+            rex_goto.cmd_rows(self.directory)
+        return [rex_goto.split_row(row)[5] for row in out.getvalue().splitlines()]
+
+    def choice_rows(self):
+        with open(os.path.join(self.directory, "choices.tsv")) as source:
+            return [rex_goto.split_row(row) for row in source.read().splitlines()]
+
+    def test_the_list_has_every_session_and_tab_nearest_first(self):
+        actions = self.call(rex_goto.cmd_choose)
+        self.assertTrue(actions.startswith("hide-preview+clear-query+clear-multi+change-prompt(session or tab> )+"))
+        self.assertIn("+reload:cat ", actions)
+        self.assertEqual(
+            [(row[4], row[5]) for row in self.choice_rows()],
+            [
+                ("all", "every session and tab"),
+                ("session", "dev"),
+                ("tab", "dev:1 edit"),
+                ("tab", "dev:2"),
+                ("session", "studio/dev"),
+                ("tab", "studio/dev:1"),
+            ],
+        )
+
+    def test_enter_in_the_list_narrows_to_the_tab(self):
+        self.call(rex_goto.cmd_choose)
+        row = "\t".join(next(row for row in self.choice_rows() if row[5] == "dev:2"))
+        actions = self.call(rex_goto.cmd_accept, "enter", row)
+        self.assertTrue(actions.startswith("show-preview+clear-query+change-prompt(dev:2 all/all> )+reload:"))
+        self.assertEqual(self.rows(), ["b2 line"])
+
+    def test_a_session_on_another_host_is_its_own(self):
+        self.call(rex_goto.cmd_choose)
+        row = "\t".join(next(row for row in self.choice_rows() if row[5] == "studio/dev"))
+        self.call(rex_goto.cmd_accept, "enter", row)
+        self.assertEqual(self.rows(), ["b9 line"])
+        # "dev" on this server is a different session with the same name.
+        self.call(rex_goto.cmd_choose)
+        row = "\t".join(next(row for row in self.choice_rows() if row[5] == "dev"))
+        self.call(rex_goto.cmd_accept, "enter", row)
+        self.assertEqual(self.rows(), ["b1 line", "b2 line"])
+
+    def test_all_clears_the_choice(self):
+        rex_goto.write_state(self.directory, {**rex_goto.initial_state(), "only": {"session_id": "x", "name": "x"}})
+        self.assertEqual(self.rows(), [])
+        self.call(rex_goto.cmd_choose)
+        self.call(rex_goto.cmd_accept, "enter", "\t".join(self.choice_rows()[0]))
+        self.assertEqual(self.rows(), ["b1 line", "b2 line", "b9 line"])
+
+    def test_esc_and_alt_t_leave_the_list_as_it_was(self):
+        self.call(rex_goto.cmd_choose)
+        self.assertTrue(self.call(rex_goto.cmd_cancel).startswith("show-preview+"))
+        self.assertFalse(rex_goto.read_state(self.directory)["choosing"])
+        self.assertEqual(self.call(rex_goto.cmd_cancel), "abort")
+        self.call(rex_goto.cmd_choose)
+        self.assertTrue(self.call(rex_goto.cmd_choose).startswith("show-preview+"))
+        self.assertIsNone(rex_goto.read_state(self.directory)["only"])
+
+    def test_accept_keys_end_the_picker_outside_the_list(self):
+        self.assertEqual(self.call(rex_goto.cmd_accept, "enter", "row"), "clear-multi+print(enter)+accept")
+        self.assertEqual(self.call(rex_goto.cmd_accept, "ctrl-y", "row"), "print(ctrl-y)+accept")
+        # In the list, the other accept keys only go back.
+        self.call(rex_goto.cmd_choose)
+        self.assertTrue(self.call(rex_goto.cmd_accept, "ctrl-y", "x").startswith("show-preview+"))
+
+    def test_cycle_keys_wait_in_the_list(self):
+        self.call(rex_goto.cmd_choose)
+        with mock.patch("sys.stdout", new=io.StringIO()) as out:
+            rex_goto.cmd_cycle(self.directory, "scope")
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(rex_goto.read_state(self.directory)["scope"], "all")
+
+    def test_refresh_collects_again_with_the_choice(self):
+        options = rex_goto.parse_args(["s", "b"])
+        with open(os.path.join(self.directory, "options.json"), "w") as out:
+            json.dump(vars(options), out)
+        rex_goto.write_state(
+            self.directory, {**rex_goto.initial_state(), "only": {"server": "", "session_id": "dev", "name": "dev"}}
+        )
+        fresh = [pane("dev", "b1", rex_goto.BLOCK), pane("ops", "b5")]
+        with (
+            mock.patch.object(rex_goto, "terminal_blocks", return_value=fresh) as listed,
+            mock.patch.object(rex_goto, "pane_lines", side_effect=lambda p, _: [p["block_id"] + " new"]),
+            mock.patch.object(rex_goto, "pane_agent", return_value=None),
+        ):
+            out = io.StringIO()
+            rex_goto.cmd_refresh(self.directory, out)
+        listed.assert_called_once_with("s", "b", "local", "", "")
+        self.assertEqual([rex_goto.split_row(row)[5] for row in out.getvalue().splitlines()], ["b1 new"])
+        # rows.tsv has every pane's rows, and the old buffers are gone.
+        self.assertEqual(
+            sorted(name for name in os.listdir(self.directory) if name.endswith(".txt")), ["0.txt", "1.txt"]
+        )
+        rex_goto.write_state(self.directory, rex_goto.initial_state())
+        self.assertEqual(self.rows(), ["b1 new", "b5 new"])
+
+    def test_refresh_in_the_list_keeps_the_list(self):
+        self.call(rex_goto.cmd_choose)
+        with mock.patch.object(rex_goto, "terminal_blocks") as listed:
+            out = io.StringIO()
+            rex_goto.cmd_refresh(self.directory, out)
+        listed.assert_not_called()
+        self.assertEqual(len(out.getvalue().splitlines()), 6)
+
+    def test_prompt(self):
+        self.assertEqual(self.call(rex_goto.cmd_prompt), "all/all>")
 
 
 class CopyTests(unittest.TestCase):
