@@ -5,7 +5,7 @@ local M = {}
 -- module path gives a usable root: a relative one would resolve against the new pane's directory.
 local default_root = (debug.getinfo(1, "S").source or ""):match("^@(/.*)/lua/[^/]*$")
 
--- Options that only the Lua side reads; the rest become the script's long flags (_ becomes -).
+-- Options that only the Lua side reads; the rest become the script's long flags (_ becomes -), lists joined by commas.
 local lua_only = { action = true, python = true, bounds = true, root = true }
 
 -- The client is the app that shows the chosen pane's session when the picker goes to it.
@@ -23,8 +23,17 @@ local function command_for(opts, ctx)
   end
   table.sort(names)
   for _, name in ipairs(names) do
+    local value = opts[name]
+    -- A list, such as sessions = { "dev", "ops" }, becomes one comma-separated flag.
+    if type(value) == "table" then
+      local parts = {}
+      for index = 1, #value do
+        parts[index] = tostring(value[index])
+      end
+      value = table.concat(parts, ",")
+    end
     table.insert(command, "--" .. name:gsub("_", "-"))
-    table.insert(command, tostring(opts[name]))
+    table.insert(command, tostring(value))
   end
   if ctx.client_id then
     table.insert(command, "--client")

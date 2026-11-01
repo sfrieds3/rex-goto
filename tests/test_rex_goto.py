@@ -246,7 +246,7 @@ class RowTests(unittest.TestCase):
                 "0\t1\t0\tscroll\tdev:1 scroll\tone",
                 "1\t2\t0\tagent\tdev:1 claude\thi",
                 "1\t1\t0\tagent\tdev:1 claude\t▌ user",
-                "2\t1\t3\tscroll\tops:1 scroll\tfar",
+                "2\t1\t4\tscroll\tops:1 scroll\tfar",
             ],
         )
 
@@ -367,7 +367,9 @@ class RowTests(unittest.TestCase):
 
     def test_old_state_files_get_the_new_defaults(self):
         rex_goto.write_state(self.directory, {"scope": "window", "source": "agent"})
-        self.assertEqual(rex_goto.read_state(self.directory), {"scope": "window", "source": "agent", "fields": "text"})
+        state = rex_goto.read_state(self.directory)
+        self.assertEqual((state["scope"], state["source"], state["fields"]), ("window", "agent", "text"))
+        self.assertEqual(state["scopes"], ["all", "session", "window"])
 
     def test_preview_marks_the_line(self):
         out = io.StringIO()
@@ -393,11 +395,28 @@ def pane(session, block, proximity=rex_goto.OTHER, window=1):
 class ConcurrencyTests(unittest.TestCase):
     """Each lookup waits at a barrier that only opens once every lookup has started, so serial calls time out."""
 
+    def test_pinned_matches_labels_ids_positions_and_window_labels(self):
+        pane = {"session": "ops", "session_id": "s2", "window": 3, "window_label": "logs"}
+        self.assertTrue(rex_goto.pinned(pane, [], []))
+        self.assertTrue(rex_goto.pinned(pane, ["ops"], []))
+        self.assertTrue(rex_goto.pinned(pane, ["s2"], ["3"]))
+        self.assertTrue(rex_goto.pinned(pane, [], ["logs"]))
+        self.assertFalse(rex_goto.pinned(pane, ["dev"], []))
+        self.assertFalse(rex_goto.pinned(pane, ["ops"], ["1", "edit"]))
+
+    def test_host_scope_only_with_other_hosts(self):
+        self.assertEqual(rex_goto.scopes_for("local"), ["all", "session", "window"])
+        self.assertEqual(rex_goto.scopes_for("all"), ["all", "host", "session", "window"])
+        self.assertEqual(rex_goto.scopes_for("local,studio"), ["all", "host", "session", "window"])
+        # A starting scope that isn't in the cycle falls back to all.
+        options = rex_goto.parse_args(["--scope", "host", "s", "b"])
+        self.assertEqual(rex_goto.initial_state(options)["scope"], "all")
+
     def test_sessions_are_looked_up_at_once(self):
         sessions = [{"session_id": f"s{index}", "label": f"s{index}"} for index in range(3)]
         barrier = threading.Barrier(2 * len(sessions), timeout=5)
 
-        def api(method, **params):
+        def api(method, server="", **params):
             if method == "session.list":
                 return {"sessions": sessions}
             barrier.wait()
@@ -457,15 +476,23 @@ import json, os, sys
 args = [arg for arg in sys.argv[1:] if not arg.startswith("--autostart")]
 if args[:1] == ["--timeout"]:
     args = args[2:]
+# Another server's fixtures are keyed HOST|...; a host with none doesn't answer.
+host = ""
+if args[:1] == ["-S"]:
+    host, args = args[1] + "|", args[2:]
 with open(os.environ["FAKE_REX_LOG"], "a") as log:
-    log.write(json.dumps(args) + "\\n")
+    log.write(json.dumps(([host[:-1]] if host else []) + args) + "\\n")
 fixture = json.load(open(os.environ["FAKE_REX_FIXTURE"]))
 if args[:2] == ["api", "call"]:
     params = json.loads(args[3])
-    key = args[2] + ("" if args[2] == "session.list" else ":" + params["session_id"])
-    print(json.dumps(fixture[key]))
+    key = host + args[2] + (":" + params["session_id"] if "session_id" in params else "")
 elif args[:2] == ["block", "call"]:
-    print(json.dumps(fixture[args[5] + ":" + args[6]]))
+    key = host + args[5] + ":" + args[6]
+else:
+    sys.exit(0)
+if key not in fixture:
+    sys.exit("rex: can't reach " + key)
+print(json.dumps(fixture[key]))
 """
 
 FAKE_FZF = """\
@@ -514,6 +541,21 @@ class PickTests(unittest.TestCase):
             "b2:process": {"foreground": claude},
             "b3:format": {"content": "Traceback (most recent call last)\n  boom\n"},
             "b3:process": {"foreground": {"pid": 2, "name": "zsh"}},
+            # Hosts: one other server that answers, one that doesn't, and one that is this server.
+            "server.status": {"host_id": "local-id"},
+            "hosts.list": {
+                "hosts": [
+                    {"label": "studio", "host_id": "studio-id"},
+                    {"label": "offline", "host_id": "offline-id"},
+                    {"label": "me", "host_id": "local-id"},
+                ]
+            },
+            "studio|session.list": {"sessions": [{"session_id": "s9", "label": "dev"}]},
+            "studio|session.view:s9": {"windows": [{"window_id": "w9", "label": ""}]},
+            "studio|session.list_blocks:s9": {
+                "blocks": [{"block_id": "b9", "window_id": "w9", "flavor": "com.superlogical.terminal.shell"}]
+            },
+            "studio|b9:format": {"content": "far away\n"},
         }
         with open(self.paths["fixture"], "w") as out:
             json.dump(fixture, out)
@@ -528,7 +570,7 @@ class PickTests(unittest.TestCase):
         os.chmod(editor, 0o755)
         self.editor = editor
 
-    def run_pick(self, query, key="enter"):
+    def run_pick(self, query, key="enter", extra=("--hosts", "all")):
         env = {
             "FAKE_REX_LOG": self.paths["log"],
             "FAKE_REX_FIXTURE": self.paths["fixture"],
@@ -541,7 +583,11 @@ class PickTests(unittest.TestCase):
             "CODEX_HOME": os.path.join(self.root, "codex"),
         }
         options = rex_goto.parse_args(
-            ["--fzf-tool", os.path.join(self.root, "fzf"), "--editor", self.editor, "--client", "client:c", "s1", "b1"]
+            [
+                *extra,
+                *("--fzf-tool", os.path.join(self.root, "fzf"), "--editor", self.editor, "--client", "client:c"),
+                *("s1", "b1"),
+            ]
         )
         with (
             mock.patch.dict(os.environ, env),
@@ -568,9 +614,36 @@ class PickTests(unittest.TestCase):
                 ("1", "agent:user", "dev:1 claude", "▌ user"),
                 ("3", "scroll", "ops:1 scroll", "  boom"),
                 ("3", "scroll", "ops:1 scroll", "Traceback (most recent call last)"),
+                ("4", "scroll", "studio/dev:1 scroll", "far away"),
             ],
         )
         self.assertFalse(any("picker" in call for call in self.calls()), "layers aren't searched")
+        self.assertFalse(any(call[:1] == ["me"] for call in self.calls()), "this server isn't searched twice")
+        self.assertFalse(any(call[:1] == ["studio"] and "process" in call for call in self.calls()), "no remote agents")
+
+    def test_only_the_local_server_by_default(self):
+        self.run_pick("boom", extra=())
+        with open(self.paths["rows"]) as source:
+            self.assertNotIn("far away", source.read())
+        self.assertFalse(any(call[2:3] == ["hosts.list"] for call in self.calls()))
+        with open(self.paths["args"]) as source:
+            self.assertIn("--prompt=all/all> ", source.read().split("\n"))
+
+    def test_pinned_sessions_and_windows(self):
+        self.run_pick("claude ui", extra=("--sessions", "dev", "--windows", "edit"))
+        with open(self.paths["rows"]) as source:
+            texts = [row.split("\t")[5] for row in source.read().splitlines()]
+        self.assertIn("claude ui", texts)
+        self.assertNotIn("  boom", texts)
+
+    def test_go_to_a_pane_on_another_host_focuses_it_there(self):
+        self.run_pick("far away", key="alt-enter")
+        self.assertEqual(self.calls()[-1], ["studio", "focus", "-s", "s9", "b9"])
+
+    def test_open_a_pane_on_another_host_names_the_host(self):
+        self.run_pick("far away")
+        with open(self.paths["edited"]) as source:
+            self.assertEqual(source.read().splitlines()[1], "studio · dev · window 1 · scrollback · b9")
 
     def test_enter_opens_the_buffer_at_the_line(self):
         self.run_pick("boom")

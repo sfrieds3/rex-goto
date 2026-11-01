@@ -22,11 +22,11 @@ Fuzzy-search every pane in [Rex](https://www.superlogical.com/rex) at once. rex-
 
 ## Features
 
-- Searches every placed terminal pane in every Rex session. Floating layers, this picker's among them, are left out.
+- Searches every placed terminal pane in every Rex session. Floating layers, this picker's among them, are left out. With `hosts`, it also searches the panes on your other Rex servers.
 - Agent panes also get their transcript: user and assistant turns, tool calls and tool results (each result clipped to 200 lines), so you can find what scrolled away or never showed on screen.
 - Rows start with the pane the picker opened from, then its window, its session, and the rest; within a pane, the newest line comes first. fzf matches only the line's text until Alt-L adds the `session:window source` label, so `ops:2 trace` finds a traceback in tab 2 of `ops`.
 - The preview shows the whole buffer with line numbers and the match in reverse video, centred. Shift-Up/Down scroll it.
-- Ctrl-R narrows the scope to this session or this window; Ctrl-S narrows the source to scrollback, agent transcripts, or just what you asked, what the agent replied, or its tool calls and results. The list reloads in place.
+- Ctrl-R narrows the scope to this host, this session or this window (host only shows up when you search other hosts); Ctrl-S narrows the source to scrollback, agent transcripts, or just what you asked, what the agent replied, or its tool calls and results. The list reloads in place.
 - A line repeated in a pane, like a prompt or a progress line, shows once, at its newest copy. The preview and the editor still show every copy.
 - Tab selects lines, and Ctrl-Y copies every selected line, in the order you picked them.
 
@@ -64,7 +64,7 @@ Then run `rex config reload`. The action also shows up in the command palette as
 | Alt-Enter, Ctrl-O | go to the pane: show its session and window, and focus it |
 | Tab, Shift-Tab | select or unselect the line |
 | Ctrl-Y | copy the selected lines, or the line under the cursor |
-| Ctrl-R | next scope: all, session, window |
+| Ctrl-R | next scope: all, host, session, window |
 | Ctrl-S | next source: all, scroll, agent, user, assistant, tool |
 | Alt-L | search labels too, or only the text again |
 | Shift-Up/Down | scroll the preview |
@@ -81,6 +81,18 @@ rex-goto finds the outermost agent in each pane's process chain, the same way Ag
 2. Otherwise, a transcript started in the agent's working directory and written since the agent started. When several agents share a directory, the most recently started one takes the most recently written transcript.
 
 Transcripts are read from `~/.pi/agent/sessions`, `~/.claude/projects` and `~/.codex/sessions`; `PI_AGENT_DIR` (or `PI_CODING_AGENT_DIR`), `CLAUDE_CONFIG_DIR` and `CODEX_HOME` move them. Subagent transcripts and `codex exec` runs are skipped.
+
+### Other hosts
+
+Rex hosts are the other Rex servers you connect to by label (`rex hosts`). With `hosts = "all"` or a list of labels, rex-goto asks each one for its panes at the same time as the local server. A host that doesn't answer within the timeout is left out. Their labels start with the host, as in `studio/dev:1 scroll`, and they come after every local pane.
+
+A pane on another host is only searched for its scrollback: its agent and transcripts are on that machine. Going to such a pane focuses it on its own server, since your app shows the local server's sessions.
+
+To search just one session or tab, pin it with `sessions` or `windows`, or bind a second action:
+
+```lua
+require("rex_goto").setup({ root = root, action = "rex_goto_ops", sessions = { "ops" } })
+```
 
 ## Configuration
 
@@ -102,7 +114,10 @@ require("rex_goto").setup({
 | `action` | `rex_goto` | Name of the action to define. Call `setup` twice for two variants. |
 | `python` | `python3` | Interpreter for `rex_goto.py`. |
 | `bounds` | `{ 0.05, 0.05, 0.9, 0.9 }` | Layer position and size as fractions of the window: x, y, width, height. |
-| `scope` | `all` | Starting scope: `all`, `session` or `window`. |
+| `scope` | `all` | Starting scope: `all`, `host`, `session` or `window`. |
+| `hosts` | `local` | Rex servers to search: `local`, `all` (this one and every host in `rex hosts`), or host labels, as a list or comma-separated. |
+| `sessions` | | Only search these sessions, by label or ID, e.g. `{ "ops" }`. |
+| `windows` | | Only search these windows (tabs), by position or label, e.g. `{ 1, "logs" }`. |
 | `source` | `all` | Starting source: `all`, `scroll`, `agent`, or a transcript role: `user`, `assistant` or `tool`. |
 | `max_lines` | `20000` | Newest lines kept per buffer. |
 | `transcripts` | `true` | Search agent transcripts. `false` searches scrollback only. |

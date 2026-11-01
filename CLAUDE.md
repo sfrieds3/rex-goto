@@ -16,6 +16,9 @@ Fuzzy search over every Rex pane's scrollback and agent transcript. See `README.
 - Dedupe drops rows, never buffer lines: buffer line numbers back the preview and the editor.
 - Keys live in `KEYS`, which builds the header. The keys that end the picker are binds that `print` their name before `accept`, not `--expect`, which can't share a key with a bind; `pick` reads the key from the first line. Only Ctrl-Y uses the multi-selection.
 - The picker's state starts from `initial_state`; `read_state` fills in keys an older state file lacks.
+- Proximity is `BLOCK, WINDOW, SESSION, HOST, OTHER`: `HOST` is the rest of the local server, `OTHER` another server's panes. The host scope is only in the Ctrl-R cycle (`state["scopes"]`) when another server is searched.
+- Every `rex` call takes `server`, a host's label for `-S`, empty for the local server. A pane on another server carries it; its agent isn't looked up, and a server that fails is skipped, but the local one still raises.
+- Pinned `sessions` and `windows` filter in `terminal_blocks`, so pinned-out panes are never collected. Lua joins list options with commas.
 - Agent detection follows Agentmux's `processAgent` and `blockAgent` (`agentmux/src/rex.mjs` in the dotfiles); keep them in step.
 - Transcript matching is a best guess: an explicit conversation on the command line, else the agent's directory and start time. Don't read other programs' state to do it.
 - New `setup` options need a matching argparse flag, a README row, and a test.
