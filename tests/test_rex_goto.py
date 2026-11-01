@@ -245,6 +245,19 @@ class RowTests(unittest.TestCase):
                 rex_goto.cmd_cycle(self.directory, "scope")
             self.assertEqual(rex_goto.read_state(self.directory)["scope"], expected)
 
+    def test_label_search_changes_the_fields_in_place(self):
+        rex_goto.write_state(self.directory, rex_goto.initial_state())
+        with mock.patch("sys.stdout", new=io.StringIO()) as out:
+            rex_goto.cmd_cycle(self.directory, "fields")
+        self.assertEqual(out.getvalue().strip(), "change-nth(1..)+change-prompt(all/all+label> )")
+        with mock.patch("sys.stdout", new=io.StringIO()) as out:
+            rex_goto.cmd_cycle(self.directory, "fields")
+        self.assertEqual(out.getvalue().strip(), "change-nth(2)+change-prompt(all/all> )")
+
+    def test_old_state_files_get_the_new_defaults(self):
+        rex_goto.write_state(self.directory, {"scope": "window", "source": "agent"})
+        self.assertEqual(rex_goto.read_state(self.directory), {"scope": "window", "source": "agent", "fields": "text"})
+
     def test_preview_marks_the_line(self):
         out = io.StringIO()
         rex_goto.cmd_preview(self.directory, "0", "3", out)
@@ -350,10 +363,11 @@ import os, sys
 rows = sys.stdin.read().splitlines()
 open(os.environ["FAKE_FZF_ARGS"], "w").write("\\n".join(sys.argv[1:]))
 open(os.environ["FAKE_FZF_ROWS"], "w").write("\\n".join(rows))
-query = os.environ["FAKE_FZF_QUERY"]
-match = next(row for row in rows if query in row.split("\\t")[5])
+# Each query picks the first row whose text holds it; several, split by |, stand for a multi-selection.
+queries = os.environ["FAKE_FZF_QUERY"].split("|")
 print(os.environ["FAKE_FZF_KEY"])
-print(match)
+for query in queries:
+    print(next(row for row in rows if query in row.split("\\t")[5]))
 """
 
 
@@ -464,6 +478,11 @@ class PickTests(unittest.TestCase):
         self.assertEqual(edited[1], f"dev · window 1 edit · claude · b2 · {self.transcript}")
         self.assertEqual(edited[3], "where is the needle")
 
+    def test_copy_copies_every_selected_line(self):
+        with mock.patch.object(rex_goto, "copy") as copy:
+            self.run_pick("boom|build ok", key="ctrl-y")
+        copy.assert_called_once_with("  boom\nbuild ok", "")
+
     def test_go_to_focuses_the_pane(self):
         self.run_pick("boom", key="alt-enter")
         self.assertEqual(
@@ -494,6 +513,15 @@ class PickTests(unittest.TestCase):
             args = source.read().split("\n")
         self.assertIn("--with-nth=5,6", args)
         self.assertIn("--nth=2", args)
+        self.assertIn("--multi", args)
+        self.assertFalse(any(arg.startswith("--expect") for arg in args), "--expect can't share keys with binds")
+        # Every accept key prints its name first, as --expect did; only copy keeps the selection.
+        self.assertIn("--bind=enter:clear-multi+print(enter)+accept", args)
+        self.assertIn("--bind=ctrl-o:clear-multi+print(ctrl-o)+accept", args)
+        self.assertIn("--bind=ctrl-y:print(ctrl-y)+accept", args)
+        header = next(arg for arg in args if arg.startswith("--header="))
+        for key, _ in rex_goto.KEYS:
+            self.assertIn(key, header)
         self.assertTrue(any(arg.startswith("--preview-window=") and arg.endswith(",~1,+{2}+1/2") for arg in args))
 
 

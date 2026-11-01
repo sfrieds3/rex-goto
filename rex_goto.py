@@ -3,7 +3,7 @@
 
 usage: rex_goto.py [options] SESSION BLOCK     # the picker; SESSION and BLOCK are the pane it opened from
        rex_goto.py rows DIR                     # fzf reload: the rows for the current scope and source
-       rex_goto.py cycle DIR scope|source       # fzf transform: next scope or source, then reload
+       rex_goto.py cycle DIR scope|source|fields  # fzf transform: next scope, source or searched fields
        rex_goto.py preview DIR BUFFER LINE      # fzf preview: BUFFER with LINE marked
 """
 
@@ -25,6 +25,9 @@ TIMEOUT = os.environ.get("REX_GOTO_TIMEOUT", "2s")
 TERMINAL = "com.superlogical.terminal"
 SCOPES = ("all", "session", "window")
 SOURCES = ("all", "scroll", "agent")
+# What fzf matches: the line's text, or its label too. The values are --nth over --with-nth's two fields.
+FIELDS = ("text", "label")
+NTH = {"text": "2", "label": "1.."}
 # Proximity to the pane the picker opened from, which orders rows and backs the scopes.
 BLOCK, WINDOW, SESSION, OTHER = range(4)
 SCOPE_LIMIT = {"window": WINDOW, "session": SESSION, "all": OTHER}
@@ -33,10 +36,23 @@ START_SLACK = 5
 TOOL_LINES = 200
 # Most rex calls in flight at once; each is its own process, mostly waiting on Rex.
 MAX_WORKERS = 32
-HELP = (
-    "enter=open  alt-enter/ctrl-o=go to pane  ctrl-y=copy  ctrl-r=scope  ctrl-s=source  "
-    "shift-up/down=scroll preview  ctrl-/=preview"
+# Each key the picker handles, with its help text, in the order the header shows them.
+KEYS = (
+    ("enter", "open"),
+    ("alt-enter/ctrl-o", "go to pane"),
+    ("tab", "select"),
+    ("ctrl-y", "copy"),
+    ("ctrl-r", "scope"),
+    ("ctrl-s", "source"),
+    ("alt-l", "search labels"),
+    ("shift-up/down", "scroll preview"),
+    ("ctrl-/", "preview"),
 )
+HELP = "  ".join(f"{key}={what}" for key, what in KEYS)
+# The keys that end the picker; each prints its name first, as --expect would.
+ACCEPT_KEYS = ("enter", "alt-enter", "ctrl-o", "ctrl-y")
+# The shell command fzf runs when the selection changes: a count, or no footer once nothing is selected.
+SELECTED_FOOTER = 'if [ "$FZF_SELECT_COUNT" -gt 0 ]; then echo "$FZF_SELECT_COUNT selected: ctrl-y copies them"; fi'
 
 
 # Rex
@@ -478,12 +494,21 @@ def transcripts_for(agents):
     return assign_transcripts([agent for agent in agents if agent])
 
 
+def initial_state(options=None):
+    """The picker's starting scope, source and searched fields."""
+    return {
+        "scope": getattr(options, "scope", "all"),
+        "source": getattr(options, "source", "all"),
+        "fields": "text",
+    }
+
+
 def read_state(directory):
     try:
         with open(os.path.join(directory, "state.json"), encoding="utf-8") as source:
-            return json.load(source)
+            return {**initial_state(), **json.load(source)}
     except (OSError, ValueError):
-        return {"scope": "all", "source": "all"}
+        return initial_state()
 
 
 def write_state(directory, state):
@@ -491,13 +516,19 @@ def write_state(directory, state):
         json.dump(state, out)
 
 
+def split_row(row):
+    """A row's fields: buffer, line, proximity, source, label, text. The text may hold anything, so it goes last."""
+    return row.rstrip("\n").split("\t", 5)
+
+
 def keep(row, state):
-    _, _, proximity, kind, _, _ = row.split("\t", 5)
+    _, _, proximity, kind, _, _ = split_row(row)
     return int(proximity) <= SCOPE_LIMIT[state["scope"]] and state["source"] in ("all", kind)
 
 
 def prompt(state):
-    return f"{state['scope']}/{state['source']}> "
+    marker = "+label" if state["fields"] == "label" else ""
+    return f"{state['scope']}/{state['source']}{marker}> "
 
 
 def cmd_rows(directory):
@@ -508,11 +539,18 @@ def cmd_rows(directory):
                 sys.stdout.write(row)
 
 
+CYCLES = {"scope": SCOPES, "source": SOURCES, "fields": FIELDS}
+
+
 def cmd_cycle(directory, what):
     state = read_state(directory)
-    values = SCOPES if what == "scope" else SOURCES
+    values = CYCLES[what]
     state[what] = values[(values.index(state[what]) + 1) % len(values)]
     write_state(directory, state)
+    if what == "fields":
+        # Which fields fzf matches changes in place; the rows stay.
+        print(f"change-nth({NTH[state['fields']]})+change-prompt({prompt(state)})")
+        return
     # reload: runs to the end of the action list, so it goes last.
     print(f"change-prompt({prompt(state)})+reload:{self_command('rows', directory)}")
 
@@ -543,22 +581,27 @@ def self_command(*args):
 
 
 def fzf_command(options, directory):
-    state = {"scope": options.scope, "source": options.source}
+    state = initial_state(options)
     return [
         *shlex.split(options.fzf_tool),
         "--delimiter=\t",
         "--with-nth=5,6",
-        "--nth=2",
+        f"--nth={NTH[state['fields']]}",
         "--no-hscroll",
         "--tiebreak=index",
+        "--multi",
         f"--layout={options.fzf_layout}",
         f"--prompt={prompt(state)}",
         f"--header={HELP}",
-        "--expect=enter,alt-enter,ctrl-o,ctrl-y",
         f"--preview={self_command('preview', directory)} {{1}} {{2}}",
         f"--preview-window={options.preview_window},~1,+{{2}}+1/2",
+        # Binds rather than --expect, which can't share a key with a bind. Only ctrl-y copies the selection;
+        # the rest act on the line under the cursor.
+        *(f"--bind={key}:{'' if key == 'ctrl-y' else 'clear-multi+'}print({key})+accept" for key in ACCEPT_KEYS),
+        f"--bind=multi:transform-footer:{SELECTED_FOOTER}",
         f"--bind=ctrl-r:transform:{self_command('cycle', directory, 'scope')}",
         f"--bind=ctrl-s:transform:{self_command('cycle', directory, 'source')}",
+        f"--bind=alt-l:transform:{self_command('cycle', directory, 'fields')}",
         "--bind=ctrl-/:toggle-preview",
     ]
 
@@ -595,7 +638,7 @@ def fzf_env(options):
 def pick(options):
     directory = tempfile.mkdtemp(prefix="rex-goto-")
     try:
-        write_state(directory, {"scope": options.scope, "source": options.source})
+        write_state(directory, initial_state(options))
         state = read_state(directory)
         # fzf opens first and shows its spinner while the rows come in.
         fzf = subprocess.Popen(
@@ -626,16 +669,18 @@ def pick(options):
             output = fzf.stdout.read()
         if fzf.wait() not in (0, 1, 130):
             raise RuntimeError(f"fzf failed with status {fzf.returncode}")
-        lines = output.split("\n")
-        if len(lines) < 2 or not lines[1]:
+        key, *rows = output.rstrip("\n").split("\n")
+        rows = [row for row in rows if row]
+        if not rows:
             return 0
-        key, row = lines[0], lines[1]
-        buffer, line, _, _, _, text = row.split("\t", 5)
+        if key == "ctrl-y":
+            # The selected lines, in the order they were picked, or the line under the cursor.
+            copy("\n".join(split_row(row)[5] for row in rows), options.clip_tool)
+            return 0
+        buffer, line, _, _, _, _ = split_row(rows[0])
         with open(os.path.join(directory, f"{int(buffer)}.json"), encoding="utf-8") as source:
             pane = json.load(source)["pane"]
-        if key == "ctrl-y":
-            copy(text, options.clip_tool)
-        elif key in ("alt-enter", "ctrl-o"):
+        if key in ("alt-enter", "ctrl-o"):
             go_to(pane, options.client)
         else:
             path = os.path.join(directory, f"{buffer}.txt")
@@ -673,7 +718,7 @@ def main(argv=None):
     command = argv[0] if argv else ""
     if command == "rows" and len(argv) == 2:
         return cmd_rows(argv[1]) or 0
-    if command == "cycle" and len(argv) == 3 and argv[2] in ("scope", "source"):
+    if command == "cycle" and len(argv) == 3 and argv[2] in CYCLES:
         return cmd_cycle(argv[1], argv[2]) or 0
     if command == "preview" and len(argv) == 4:
         return cmd_preview(*argv[1:]) or 0
