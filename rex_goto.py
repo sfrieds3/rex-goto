@@ -23,7 +23,7 @@ import time
 REX = os.environ.get("REX_BIN") or "rex"
 TIMEOUT = os.environ.get("REX_GOTO_TIMEOUT", "2s")
 TERMINAL = "com.superlogical.terminal"
-SCOPES = ("all", "session", "window")
+SCOPES = ("all", "host", "session", "window")
 # A transcript's lines also narrow by role: what you asked, what the agent said, and its tool calls and results.
 ROLES = ("user", "assistant", "tool")
 SOURCES = ("all", "scroll", "agent", *ROLES)
@@ -31,8 +31,11 @@ SOURCES = ("all", "scroll", "agent", *ROLES)
 FIELDS = ("text", "label")
 NTH = {"text": "2", "label": "1.."}
 # Proximity to the pane the picker opened from, which orders rows and backs the scopes.
-BLOCK, WINDOW, SESSION, OTHER = range(4)
-SCOPE_LIMIT = {"window": WINDOW, "session": SESSION, "all": OTHER}
+# HOST is the rest of the origin's Rex server; OTHER is every other server's panes.
+BLOCK, WINDOW, SESSION, HOST, OTHER = range(5)
+SCOPE_LIMIT = {"window": WINDOW, "session": SESSION, "host": HOST, "all": OTHER}
+# --hosts: which Rex servers to search. LOCAL is the one the picker runs on; ALL_HOSTS adds every host in hosts.list.
+LOCAL, ALL_HOSTS = "local", "all"
 # A transcript written up to this long before ps says its agent started still counts as the agent's.
 START_SLACK = 5
 TOOL_LINES = 200
@@ -60,9 +63,10 @@ SELECTED_FOOTER = 'if [ "$FZF_SELECT_COUNT" -gt 0 ]; then echo "$FZF_SELECT_COUN
 # Rex
 
 
-def rex(*args):
+def rex(*args, server=""):
+    """Runs rex with ARGS and returns its JSON output. SERVER, a host's label, sends the call to that Rex server."""
     result = subprocess.run(
-        [REX, "--autostart=false", "--timeout", TIMEOUT, *args],
+        [REX, "--autostart=false", "--timeout", TIMEOUT, *(["-S", server] if server else []), *args],
         capture_output=True,
         text=True,
         timeout=15,
@@ -72,18 +76,19 @@ def rex(*args):
     return json.loads(result.stdout or "null")
 
 
-def rex_run(*args):
-    result = subprocess.run([REX, "--autostart=false", *args], capture_output=True, text=True, timeout=15)
+def rex_run(*args, server=""):
+    command = [REX, "--autostart=false", *(["-S", server] if server else []), *args]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=15)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"rex {args[0]} failed")
 
 
-def api(method, **params):
-    return rex("api", "call", method, json.dumps(params)) or {}
+def api(method, server="", **params):
+    return rex("api", "call", method, json.dumps(params), server=server) or {}
 
 
-def block_call(session, block, method, params=None):
-    return rex("block", "call", "-s", session, "-b", block, method, json.dumps(params or {})) or {}
+def block_call(session, block, method, params=None, server=""):
+    return rex("block", "call", "-s", session, "-b", block, method, json.dumps(params or {}), server=server) or {}
 
 
 def is_terminal(entry):
@@ -92,15 +97,50 @@ def is_terminal(entry):
     return kind.startswith(TERMINAL) and entry.get("placement", "placed") == "placed"
 
 
-def terminal_blocks(origin_session, origin_block):
-    """Every placed terminal block in every session, nearest the origin first."""
+def names(value):
+    """A comma-separated option as a list of names, empty for none."""
+    return [name.strip() for name in str(value or "").split(",") if name.strip()]
+
+
+def servers(hosts):
+    """The servers HOSTS names, as (server, host) pairs: "" for the local server, else a host's label for both.
+
+    ALL_HOSTS means the local server and every host in hosts.list, less any that is the local server itself.
+    """
+    wanted = names(hosts) or [LOCAL]
+    found = [("", "")] if LOCAL in wanted or ALL_HOSTS in wanted else []
+    if wanted == [LOCAL]:
+        return found
+    local_id = api("server.status").get("host_id")
+    for host in api("hosts.list").get("hosts") or []:
+        label = host.get("label")
+        if not label or (local_id and host.get("host_id") == local_id):
+            continue
+        if ALL_HOSTS in wanted or label.lower() in (name.lower() for name in wanted):
+            found.append((label, label))
+    return found
+
+
+def pinned(pane, sessions, windows):
+    """Whether the pane is in one of the pinned sessions, by label or ID, and windows, by position or label."""
+    if sessions and pane["session"] not in sessions and pane["session_id"] not in sessions:
+        return False
+    return not windows or str(pane["window"]) in windows or (pane["window_label"] and pane["window_label"] in windows)
+
+
+def server_blocks(server, host):
+    """Every placed terminal block on one Rex server, in session order. A host that doesn't answer has none."""
+    try:
+        sessions = [s for s in api("session.list", server=server).get("sessions") or [] if s.get("session_id")]
+        with concurrent.futures.ThreadPoolExecutor(min(MAX_WORKERS, 2 * len(sessions)) or 1) as pool:
+            views = [pool.submit(api, "session.view", server, session_id=s["session_id"]) for s in sessions]
+            listed = [pool.submit(api, "session.list_blocks", server, session_id=s["session_id"]) for s in sessions]
+            listings = [(view.result(), blocks.result()) for view, blocks in zip(views, listed, strict=True)]
+    except (RuntimeError, subprocess.SubprocessError, ValueError):
+        if not server:
+            raise
+        return []
     found = []
-    origin_window = None
-    sessions = [session for session in api("session.list").get("sessions") or [] if session.get("session_id")]
-    with concurrent.futures.ThreadPoolExecutor(min(MAX_WORKERS, 2 * len(sessions)) or 1) as pool:
-        views = [pool.submit(api, "session.view", session_id=session["session_id"]) for session in sessions]
-        listed = [pool.submit(api, "session.list_blocks", session_id=session["session_id"]) for session in sessions]
-        listings = [(view.result(), blocks.result()) for view, blocks in zip(views, listed, strict=True)]
     for session, (view, blocks) in zip(sessions, listings, strict=True):
         session_id = session["session_id"]
         windows = {}
@@ -110,35 +150,62 @@ def terminal_blocks(origin_session, origin_block):
             if not entry.get("block_id") or not is_terminal(entry):
                 continue
             index, label = windows.get(entry.get("window_id"), (0, ""))
-            pane = {
-                "session_id": session_id,
-                "session": session.get("label") or session_id,
-                "window_id": entry.get("window_id") or "",
-                "window": index,
-                "window_label": label,
-                "block_id": entry["block_id"],
-            }
-            if entry["block_id"] == origin_block:
-                origin_window = pane["window_id"]
-            found.append(pane)
+            found.append(
+                {
+                    "server": server,
+                    "host": host,
+                    "session_id": session_id,
+                    "session": session.get("label") or session_id,
+                    "window_id": entry.get("window_id") or "",
+                    "window": index,
+                    "window_label": label,
+                    "block_id": entry["block_id"],
+                }
+            )
+    return found
+
+
+def terminal_blocks(origin_session, origin_block, hosts=LOCAL, sessions="", windows=""):
+    """Every placed terminal block on the HOSTS servers, in the pinned SESSIONS and WINDOWS, nearest the origin first.
+
+    Each server is listed at once. The origin is on the local server, so another server's panes come last.
+    """
+    targets = servers(hosts)
+    with concurrent.futures.ThreadPoolExecutor(len(targets) or 1) as pool:
+        listed = list(pool.map(lambda target: server_blocks(*target), targets))
+    found = [pane for panes in listed for pane in panes]
+    origin_window = next(
+        (pane["window_id"] for pane in found if not pane["server"] and pane["block_id"] == origin_block), None
+    )
     for pane in found:
-        if pane["block_id"] == origin_block:
+        if pane["server"]:
+            pane["proximity"] = OTHER
+        elif pane["block_id"] == origin_block:
             pane["proximity"] = BLOCK
         elif pane["session_id"] == origin_session and pane["window_id"] == origin_window:
             pane["proximity"] = WINDOW
         elif pane["session_id"] == origin_session:
             pane["proximity"] = SESSION
         else:
-            pane["proximity"] = OTHER
+            pane["proximity"] = HOST
+    sessions, windows = names(sessions), names(windows)
+    found = [pane for pane in found if pinned(pane, sessions, windows)]
     return sorted(found, key=lambda pane: pane["proximity"])
 
 
 def scrollback(pane):
-    return block_call(pane["session_id"], pane["block_id"], "format", {"unwrap": True, "trim": True}).get("content", "")
+    params = {"unwrap": True, "trim": True}
+    return block_call(pane["session_id"], pane["block_id"], "format", params, pane.get("server", "")).get("content", "")
 
 
 def go_to(pane, client):
-    """Shows the pane's session and window in the app, then focuses the pane, as Agentmux does."""
+    """Shows the pane's session and window in the app, then focuses the pane, as Agentmux does.
+
+    The client shows the local server's sessions, so a pane on another host is only focused there.
+    """
+    if pane.get("server"):
+        rex_run("focus", "-s", pane["session_id"], pane["block_id"], server=pane["server"])
+        return
     if client:
         select = ["-C", client, "do", "session.select", f"session_id={pane['session_id']}"]
         rex_run(*select, *([f"window_id={pane['window_id']}"] if pane.get("window_id") else []))
@@ -433,7 +500,8 @@ def write_buffers(directory, buffers, dedupe=True):
 
 
 def label_for(pane, source):
-    return f"{pane['session']}:{pane['window']} {source}"
+    host = f"{pane['host']}/" if pane.get("host") else ""
+    return f"{host}{pane['session']}:{pane['window']} {source}"
 
 
 def pane_lines(pane, max_lines):
@@ -442,7 +510,12 @@ def pane_lines(pane, max_lines):
 
 
 def pane_agent(pane):
-    """The agent running in the pane, with its start time and resumed conversation, or None."""
+    """The agent running in the pane, with its start time and resumed conversation, or None.
+
+    Its process and transcripts are on the pane's own machine, so a pane on another host has none.
+    """
+    if pane.get("server"):
+        return None
     agent = None
     with contextlib.suppress(RuntimeError):
         agent = block_agent(block_call(pane["session_id"], pane["block_id"], "process"))
@@ -454,7 +527,8 @@ def pane_agent(pane):
 
 def pane_title(pane, source):
     window = f" {pane['window_label']}" if pane["window_label"] else ""
-    return f"{pane['session']} · window {pane['window']}{window} · {source} · {pane['block_id']}"
+    host = f"{pane['host']} · " if pane.get("host") else ""
+    return f"{host}{pane['session']} · window {pane['window']}{window} · {source} · {pane['block_id']}"
 
 
 def build(directory, panes, max_lines, transcripts=True, dedupe=True):
@@ -515,12 +589,20 @@ def transcripts_for(agents):
     return assign_transcripts([agent for agent in agents if agent])
 
 
+def scopes_for(hosts):
+    """The scopes Ctrl-R cycles through: host only means something when another server is searched."""
+    return list(SCOPES) if names(hosts) not in ([], [LOCAL]) else [scope for scope in SCOPES if scope != "host"]
+
+
 def initial_state(options=None):
-    """The picker's starting scope, source and searched fields."""
+    """The picker's starting scope, source and searched fields, and the scopes to cycle through."""
+    scopes = scopes_for(getattr(options, "hosts", LOCAL))
+    scope = getattr(options, "scope", "all")
     return {
-        "scope": getattr(options, "scope", "all"),
+        "scope": scope if scope in scopes else "all",
         "source": getattr(options, "source", "all"),
         "fields": "text",
+        "scopes": scopes,
     }
 
 
@@ -566,7 +648,7 @@ CYCLES = {"scope": SCOPES, "source": SOURCES, "fields": FIELDS}
 
 def cmd_cycle(directory, what):
     state = read_state(directory)
-    values = CYCLES[what]
+    values = state["scopes"] if what == "scope" else CYCLES[what]
     state[what] = values[(values.index(state[what]) + 1) % len(values)]
     write_state(directory, state)
     if what == "fields":
@@ -672,7 +754,9 @@ def pick(options):
         )
         try:
             with open(os.path.join(directory, "rows.tsv"), "w", encoding="utf-8") as rows:
-                panes = terminal_blocks(options.session, options.block)
+                panes = terminal_blocks(
+                    options.session, options.block, options.hosts, options.sessions, options.windows
+                )
                 chunks = build(directory, panes, options.max_lines, options.transcripts, options.dedupe)
                 with contextlib.closing(chunks):
                     for chunk in chunks:
@@ -723,6 +807,11 @@ def parse_args(argv):
     parser.add_argument("--client", default="", help="Rex client to show the chosen pane's session in")
     parser.add_argument("--scope", choices=SCOPES, default="all")
     parser.add_argument("--source", choices=SOURCES, default="all")
+    parser.add_argument(
+        "--hosts", default=LOCAL, help="Rex servers to search: local, all, or host labels, comma-separated"
+    )
+    parser.add_argument("--sessions", default="", help="only these sessions, by label or ID, comma-separated")
+    parser.add_argument("--windows", default="", help="only these windows, by position or label, comma-separated")
     parser.add_argument("--max-lines", type=int, default=20000, help="newest lines kept per buffer")
     parser.add_argument("--transcripts", type=boolean, default=True, help="search agent transcripts too")
     parser.add_argument("--dedupe", type=boolean, default=True, help="one row per repeated line in a buffer")

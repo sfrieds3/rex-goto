@@ -49,6 +49,19 @@ same(
   }
 )
 
+-- Lists become one comma-separated flag; a window position may be a number.
+same(
+  rex_goto.command_for({ root = "/r", sessions = { "dev", "ops" }, windows = { 2, "logs" }, hosts = "all" }, ctx),
+  {
+    "python3", "/r/rex_goto.py",
+    "--hosts", "all",
+    "--sessions", "dev,ops",
+    "--windows", "2,logs",
+    "--client", "client:c",
+    "session:a", "block:b",
+  }
+)
+
 -- Without a client there is no --client flag.
 same(rex_goto.command_for({ root = "/r" }, { session_id = "s", block_id = "b" }), { "python3", "/r/rex_goto.py", "s", "b" })
 
