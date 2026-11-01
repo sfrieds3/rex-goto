@@ -28,6 +28,6 @@ For a live check, create a throwaway session (`rex new`), open the script with `
 
 ## Commits and releases
 
-- Use Conventional Commits: `<type>(<scope>): <description>` with `feat`, `fix`, `refactor`, `docs`, `test`, `chore` or `ci`.
-- Each push to `main` runs CI; when it passes, `feat`, `fix` and breaking commits (`!` or `BREAKING CHANGE`) since the last tag produce a new tag and GitHub release. Other types don't release.
+- Use Conventional Commits: `<type>(<scope>): <description>` with `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `chore` or `ci`.
+- Each push to `main` runs CI; when it passes, `feat`, `fix`, `perf` and breaking commits (`!` or `BREAKING CHANGE`) since the last tag produce a new tag and GitHub release; `fix` and `perf` bump the patch version. Other types don't release.
 - Use generic names and fixtures in tests and docs; never reference real projects, hosts or people.
