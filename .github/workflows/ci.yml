@@ -49,7 +49,7 @@ jobs:
         with:
           args: format --check
 
-  # Tags and releases each push to main that has a feat, fix or breaking commit since the last tag.
+  # Tags and releases each push to main that has a feat, fix, perf or breaking commit since the last tag.
   release:
     name: Release
     needs: [python, lua, lint]
@@ -67,7 +67,7 @@ jobs:
         run: |
           version=$(.github/scripts/next-version.sh)
           if [[ -z $version ]]; then
-            echo "No feat, fix or breaking commits since the last release; nothing to release."
+            echo "No feat, fix, perf or breaking commits since the last release; nothing to release."
             exit 0
           fi
           last=$(git tag --merged HEAD --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)

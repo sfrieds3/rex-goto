@@ -13,7 +13,7 @@ if grep -qE '^BREAKING[ -]CHANGE:' <<<"$bodies" || grep -qE '^[a-z]+(\([^)]*\))?
   bump=major
 elif grep -qE '^feat(\([^)]*\))?:' <<<"$subjects"; then
   bump=minor
-elif grep -qE '^fix(\([^)]*\))?:' <<<"$subjects"; then
+elif grep -qE '^(fix|perf)(\([^)]*\))?:' <<<"$subjects"; then
   bump=patch
 else
   exit 0
