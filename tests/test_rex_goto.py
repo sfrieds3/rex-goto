@@ -89,6 +89,35 @@ class RenderTests(unittest.TestCase):
             ],
         )
 
+    def test_roles_follow_each_line(self):
+        records = [
+            {"type": "user", "message": {"content": "fix it"}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": "ls"}]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "a\nb"}]}},
+            {"type": "assistant", "message": {"content": "done"}},
+        ]
+        roles = []
+        lines = rex_goto.render("claude", records, roles)
+        self.assertEqual(len(roles), len(lines))
+        self.assertEqual(
+            list(zip(lines, roles, strict=True)),
+            [
+                ("▌ user", "user"),
+                ("fix it", "user"),
+                ("", "user"),
+                ("▌ tool: Bash", "tool"),
+                ("ls", "tool"),
+                ("", "tool"),
+                ("▌ result", "tool"),
+                ("a", "tool"),
+                ("b", "tool"),
+                ("", "tool"),
+                ("▌ assistant", "assistant"),
+                ("done", "assistant"),
+                ("", "assistant"),
+            ],
+        )
+
     def test_pi(self):
         records = [
             {"type": "session", "id": ID_A, "cwd": "/w"},
@@ -233,6 +262,74 @@ class RowTests(unittest.TestCase):
         self.assertEqual(self.rows_for({"scope": "all", "source": "agent"}), ["hi", "▌ user"])
         self.assertEqual(self.rows_for({"scope": "all", "source": "scroll"}), ["two    x", "one", "far"])
 
+    def test_roles(self):
+        directory = tempfile.mkdtemp()
+        buffer = {
+            "id": 0,
+            "kind": "agent",
+            "label": "dev:1 pi",
+            "title": "t",
+            "lines": ["▌ user", "ask", "▌ assistant", "answer", "▌ tool: bash", "ls"],
+            "roles": ["user", "user", "assistant", "assistant", "tool", "tool"],
+            "pane": {},
+            "proximity": rex_goto.BLOCK,
+        }
+        rows = list(rex_goto.write_buffers(directory, [buffer]))
+        self.assertEqual([rex_goto.split_row(row)[3] for row in rows][:2], ["agent:tool", "agent:tool"])
+        texts = {
+            source: [
+                rex_goto.split_row(row)[5] for row in rows if rex_goto.keep(row, {"scope": "all", "source": source})
+            ]
+            for source in ("agent", "user", "assistant", "tool", "scroll")
+        }
+        self.assertEqual(texts["agent"], ["ls", "▌ tool: bash", "answer", "▌ assistant", "ask", "▌ user"])
+        self.assertEqual(texts["user"], ["ask", "▌ user"])
+        self.assertEqual(texts["assistant"], ["answer", "▌ assistant"])
+        self.assertEqual(texts["tool"], ["ls", "▌ tool: bash"])
+        self.assertEqual(texts["scroll"], [])
+        self.assertEqual(rex_goto.SOURCES, ("all", "scroll", "agent", "user", "assistant", "tool"))
+
+    def test_dedupe_keeps_the_newest_copy(self):
+        directory = tempfile.mkdtemp()
+        buffer = {
+            "id": 0,
+            "kind": "scroll",
+            "label": "dev:1 scroll",
+            "title": "t",
+            "lines": ["$ make", "ok", "$ make", "ok", "done"],
+            "pane": {},
+            "proximity": rex_goto.BLOCK,
+        }
+        rows = [rex_goto.split_row(row) for row in rex_goto.write_buffers(directory, [buffer])]
+        self.assertEqual([(row[1], row[5]) for row in rows], [("5", "done"), ("4", "ok"), ("3", "$ make")])
+        # The buffer keeps every line, so the preview and the editor still show the earlier copies.
+        with open(os.path.join(directory, "0.txt")) as source:
+            self.assertEqual(source.read().splitlines()[1:], buffer["lines"])
+        rows = list(rex_goto.write_buffers(directory, [buffer], dedupe=False))
+        self.assertEqual(len(rows), 5)
+
+    def test_dedupe_keeps_a_line_once_per_role(self):
+        buffer = {
+            "id": 0,
+            "kind": "agent",
+            "label": "dev:1 pi",
+            "title": "t",
+            "lines": ["▌ user", "ok", "▌ assistant", "ok", "▌ user", "ok"],
+            "roles": ["user", "user", "assistant", "assistant", "user", "user"],
+            "pane": {},
+            "proximity": rex_goto.BLOCK,
+        }
+        rows = [rex_goto.split_row(row) for row in rex_goto.write_buffers(tempfile.mkdtemp(), [buffer])]
+        self.assertEqual(
+            [(row[1], row[3], row[5]) for row in rows],
+            [
+                ("6", "agent:user", "ok"),
+                ("5", "agent:user", "▌ user"),
+                ("4", "agent:assistant", "ok"),
+                ("3", "agent:assistant", "▌ assistant"),
+            ],
+        )
+
     def test_cycle(self):
         rex_goto.write_state(self.directory, {"scope": "all", "source": "all"})
         with mock.patch("sys.stdout", new=io.StringIO()) as out:
@@ -253,6 +350,20 @@ class RowTests(unittest.TestCase):
         with mock.patch("sys.stdout", new=io.StringIO()) as out:
             rex_goto.cmd_cycle(self.directory, "fields")
         self.assertEqual(out.getvalue().strip(), "change-nth(2)+change-prompt(all/all> )")
+
+    def test_source_cycle_goes_through_the_roles(self):
+        rex_goto.write_state(self.directory, rex_goto.initial_state())
+        seen = []
+        for _ in rex_goto.SOURCES:
+            with mock.patch("sys.stdout", new=io.StringIO()):
+                rex_goto.cmd_cycle(self.directory, "source")
+            seen.append(rex_goto.read_state(self.directory)["source"])
+        self.assertEqual(seen, ["scroll", "agent", "user", "assistant", "tool", "all"])
+
+    def test_dedupe_flag(self):
+        self.assertTrue(rex_goto.parse_args(["s", "b"]).dedupe)
+        self.assertFalse(rex_goto.parse_args(["--dedupe", "false", "s", "b"]).dedupe)
+        self.assertEqual(rex_goto.parse_args(["--source", "user", "s", "b"]).source, "user")
 
     def test_old_state_files_get_the_new_defaults(self):
         rex_goto.write_state(self.directory, {"scope": "window", "source": "agent"})
@@ -453,8 +564,8 @@ class PickTests(unittest.TestCase):
                 ("0", "scroll", "dev:1 scroll", "build ok"),
                 ("0", "scroll", "dev:1 scroll", "$ make"),
                 ("1", "scroll", "dev:1 scroll", "claude ui"),
-                ("1", "agent", "dev:1 claude", "where is the needle"),
-                ("1", "agent", "dev:1 claude", "▌ user"),
+                ("1", "agent:user", "dev:1 claude", "where is the needle"),
+                ("1", "agent:user", "dev:1 claude", "▌ user"),
                 ("3", "scroll", "ops:1 scroll", "  boom"),
                 ("3", "scroll", "ops:1 scroll", "Traceback (most recent call last)"),
             ],

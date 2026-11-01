@@ -12,7 +12,8 @@ Fuzzy search over every Rex pane's scrollback and agent transcript. See `README.
 
 - Each run writes its buffers to a private temporary directory, removed when the picker exits. A buffer file's first line is its title; its lines follow, so buffer line N is file line N+1. Each buffer `ID.txt` has its pane in `ID.json`.
 - fzf opens before any `rex` call, and `build` streams rows pane by pane, nearest first, with every `rex` call in flight at once. Labels are padded to a width known from the pane list alone, so a new source name must go in `SOURCE_NAMES`.
-- A row is `buffer, line, proximity, source, label, text`, tab-separated; split it with `split_row`. fzf shows fields 5 and 6 and searches field 6, or both with Alt-L (`NTH`, which counts `--with-nth` fields); keep `--with-nth` and `NTH` in step with the row.
+- A row is `buffer, line, proximity, source, label, text`, tab-separated. A transcript row's source is `agent:ROLE`, with `ROLE` from `ROLES`, and `keep` matches either half; split it with `split_row`. fzf shows fields 5 and 6 and searches field 6, or both with Alt-L (`NTH`, which counts `--with-nth` fields); keep `--with-nth` and `NTH` in step with the row.
+- Dedupe drops rows, never buffer lines: buffer line numbers back the preview and the editor.
 - Keys live in `KEYS`, which builds the header. The keys that end the picker are binds that `print` their name before `accept`, not `--expect`, which can't share a key with a bind; `pick` reads the key from the first line. Only Ctrl-Y uses the multi-selection.
 - The picker's state starts from `initial_state`; `read_state` fills in keys an older state file lacks.
 - Agent detection follows Agentmux's `processAgent` and `blockAgent` (`agentmux/src/rex.mjs` in the dotfiles); keep them in step.
