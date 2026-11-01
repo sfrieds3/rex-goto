@@ -4,6 +4,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -253,6 +254,79 @@ class RowTests(unittest.TestCase):
         )
 
 
+def pane(session, block, proximity=rex_goto.OTHER, window=1):
+    return {
+        "session_id": session,
+        "session": session,
+        "window_id": f"{session}-w{window}",
+        "window": window,
+        "window_label": "",
+        "block_id": block,
+        "proximity": proximity,
+    }
+
+
+class ConcurrencyTests(unittest.TestCase):
+    """Each lookup waits at a barrier that only opens once every lookup has started, so serial calls time out."""
+
+    def test_sessions_are_looked_up_at_once(self):
+        sessions = [{"session_id": f"s{index}", "label": f"s{index}"} for index in range(3)]
+        barrier = threading.Barrier(2 * len(sessions), timeout=5)
+
+        def api(method, **params):
+            if method == "session.list":
+                return {"sessions": sessions}
+            barrier.wait()
+            if method == "session.view":
+                return {"windows": [{"window_id": "w", "label": ""}]}
+            return {"blocks": [{"block_id": params["session_id"] + "b", "window_id": "w", "flavor": rex_goto.TERMINAL}]}
+
+        with mock.patch.object(rex_goto, "api", side_effect=api):
+            panes = rex_goto.terminal_blocks("s1", "s1b")
+        self.assertEqual([(p["block_id"], p["proximity"]) for p in panes][0], ("s1b", rex_goto.BLOCK))
+        self.assertEqual(len(panes), 3)
+
+    def test_panes_are_collected_at_once_and_streamed_in_order(self):
+        panes = [pane("dev", f"b{index}") for index in range(10)]
+        barrier = threading.Barrier(2 * len(panes), timeout=5)
+
+        def lines(pane, max_lines):
+            barrier.wait()
+            return [pane["block_id"]]
+
+        def agent(pane):
+            barrier.wait()
+
+        with (
+            mock.patch.object(rex_goto, "pane_lines", side_effect=lines),
+            mock.patch.object(rex_goto, "pane_agent", side_effect=agent),
+        ):
+            chunks = list(rex_goto.build(tempfile.mkdtemp(), panes, 100))
+        self.assertEqual([[row.split("\t")[5] for row in chunk] for chunk in chunks], [[p["block_id"]] for p in panes])
+
+    def test_labels_are_padded_before_any_pane_is_in(self):
+        panes = [pane("dev", "b1"), pane("operations", "b2", window=12)]
+        directory = tempfile.mkdtemp()
+        with (
+            mock.patch.object(rex_goto, "pane_lines", return_value=["x"]),
+            mock.patch.object(rex_goto, "pane_agent", return_value=None),
+        ):
+            rows = [row for chunk in rex_goto.build(directory, panes, 100) for row in chunk]
+        labels = [row.split("\t")[4] for row in rows]
+        self.assertEqual(len({len(label) for label in labels}), 1)
+        self.assertEqual(len(labels[0]), len("operations:12 claude"))
+        with open(os.path.join(directory, "1.json")) as source:
+            self.assertEqual(json.load(source), {"pane": panes[1], "kind": "scroll"})
+
+    def test_no_transcripts_skips_the_process_lookup(self):
+        with (
+            mock.patch.object(rex_goto, "pane_lines", return_value=["x"]),
+            mock.patch.object(rex_goto, "pane_agent") as agent,
+        ):
+            list(rex_goto.build(tempfile.mkdtemp(), [pane("dev", "b1")], 100, transcripts=False))
+        agent.assert_not_called()
+
+
 FAKE_REX = """\
 #!/usr/bin/env python3
 import json, os, sys
@@ -396,6 +470,23 @@ class PickTests(unittest.TestCase):
             self.calls()[-2:],
             [["-C", "client:c", "do", "session.select", "session_id=s2", "window_id=w2"], ["focus", "-s", "s2", "b3"]],
         )
+
+    def test_fzf_opens_before_the_panes_are_listed(self):
+        started = []
+
+        def listing(*args):
+            started.append(popen.called)
+            raise RuntimeError("rex is down")
+
+        fzf = mock.Mock()
+        with (
+            mock.patch.object(rex_goto.subprocess, "Popen", return_value=fzf) as popen,
+            mock.patch.object(rex_goto, "terminal_blocks", side_effect=listing),
+            self.assertRaises(RuntimeError),
+        ):
+            rex_goto.pick(rex_goto.parse_args(["s1", "b1"]))
+        self.assertEqual(started, [True])
+        fzf.terminate.assert_called_once()
 
     def test_fzf_searches_only_the_text(self):
         self.run_pick("boom")

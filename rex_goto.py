@@ -31,6 +31,8 @@ SCOPE_LIMIT = {"window": WINDOW, "session": SESSION, "all": OTHER}
 # A transcript written up to this long before ps says its agent started still counts as the agent's.
 START_SLACK = 5
 TOOL_LINES = 200
+# Most rex calls in flight at once; each is its own process, mostly waiting on Rex.
+MAX_WORKERS = 32
 HELP = (
     "enter=open  alt-enter/ctrl-o=go to pane  ctrl-y=copy  ctrl-r=scope  ctrl-s=source  "
     "shift-up/down=scroll preview  ctrl-/=preview"
@@ -76,14 +78,17 @@ def terminal_blocks(origin_session, origin_block):
     """Every placed terminal block in every session, nearest the origin first."""
     found = []
     origin_window = None
-    for session in api("session.list").get("sessions") or []:
-        session_id = session.get("session_id")
-        if not session_id:
-            continue
+    sessions = [session for session in api("session.list").get("sessions") or [] if session.get("session_id")]
+    with concurrent.futures.ThreadPoolExecutor(min(MAX_WORKERS, 2 * len(sessions)) or 1) as pool:
+        views = [pool.submit(api, "session.view", session_id=session["session_id"]) for session in sessions]
+        listed = [pool.submit(api, "session.list_blocks", session_id=session["session_id"]) for session in sessions]
+        listings = [(view.result(), blocks.result()) for view, blocks in zip(views, listed, strict=True)]
+    for session, (view, blocks) in zip(sessions, listings, strict=True):
+        session_id = session["session_id"]
         windows = {}
-        for index, window in enumerate(api("session.view", session_id=session_id).get("windows") or [], 1):
+        for index, window in enumerate(view.get("windows") or [], 1):
             windows[window.get("window_id")] = (index, window.get("label") or "")
-        for entry in api("session.list_blocks", session_id=session_id).get("blocks") or []:
+        for entry in blocks.get("blocks") or []:
             if not entry.get("block_id") or not is_terminal(entry):
                 continue
             index, label = windows.get(entry.get("window_id"), (0, ""))
@@ -130,6 +135,8 @@ AGENT_SCRIPTS = (
     ("claude", re.compile(r"/(?:claude-code/cli\.js|claude)$")),
 )
 AGENT_NAMES = {"pi": "pi", "claude": "claude", "claude-code": "claude", "codex": "codex"}
+# Every source a label names, to pad labels before any pane is in.
+SOURCE_NAMES = ("scroll", *sorted(set(AGENT_NAMES.values())))
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
 
@@ -374,13 +381,15 @@ def clean(line):
 
 
 def write_buffers(directory, buffers):
-    """Writes each buffer and yields its rows, newest line first:
+    """Writes each buffer, ID.txt, and its pane, ID.json, then yields its rows, newest line first:
     buffer, line, proximity, source, label, text. fzf searches only the text."""
     for buffer in buffers:
         lines = [clean(line) for line in buffer["lines"]]
         with open(os.path.join(directory, f"{buffer['id']}.txt"), "w", encoding="utf-8") as out:
             out.write(buffer["title"] + "\n")
             out.write("\n".join(lines) + "\n")
+        with open(os.path.join(directory, f"{buffer['id']}.json"), "w", encoding="utf-8") as out:
+            json.dump({"pane": buffer["pane"], "kind": buffer["kind"]}, out)
         for number in range(len(lines), 0, -1):
             text = lines[number - 1]
             if text.strip():
@@ -393,16 +402,20 @@ def label_for(pane, source):
     return f"{pane['session']}:{pane['window']} {source}"
 
 
-def collect(pane, max_lines):
-    """The pane's scrollback buffer, and its agent if one runs there."""
-    lines = scrollback(pane).rstrip("\n").split("\n")[-max_lines:]
+def pane_lines(pane, max_lines):
+    """The newest MAX_LINES lines of the pane's scrollback."""
+    return scrollback(pane).rstrip("\n").split("\n")[-max_lines:]
+
+
+def pane_agent(pane):
+    """The agent running in the pane, with its start time and resumed conversation, or None."""
     agent = None
     with contextlib.suppress(RuntimeError):
         agent = block_agent(block_call(pane["session_id"], pane["block_id"], "process"))
     if agent:
         agent["started"] = started_at(agent["pid"])
         agent["resumed"] = resumed_id(agent["agent"], shlex.split(ps(agent["pid"], "args")))
-    return lines, agent
+    return agent
 
 
 def pane_title(pane, source):
@@ -411,51 +424,58 @@ def pane_title(pane, source):
 
 
 def build(directory, panes, max_lines, transcripts=True):
-    """Collects every pane in parallel, matches agents to transcripts, writes the buffers, then yields their rows,
-    nearest pane first."""
-    with concurrent.futures.ThreadPoolExecutor(8) as pool:
-        collected = list(pool.map(lambda pane: (pane, *collect(pane, max_lines)), panes))
-    for index, (_, _, agent) in enumerate(collected):
+    """Writes each pane's buffers and yields their rows, one list per pane, nearest pane first.
+
+    Every rex call starts at once, and a pane's rows go out as soon as its scrollback is in. Matching transcripts
+    needs every agent, so it waits until the first pane that runs one.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(min(MAX_WORKERS, 2 * len(panes)) or 1)
+    try:
+        scrolls, agents = [], []
+        for pane in panes:
+            scrolls.append(pool.submit(pane_lines, pane, max_lines))
+            agents.append(pool.submit(pane_agent, pane) if transcripts else None)
+        # Known before any pane is in: no agent's name is longer than "scroll".
+        width = max((len(label_for(pane, name)) for pane in panes for name in SOURCE_NAMES), default=0)
+        found = None
+        next_id = 0
+        for index, pane in enumerate(panes):
+            buffers = [
+                {
+                    "kind": "scroll",
+                    "label": label_for(pane, "scroll"),
+                    "title": pane_title(pane, "scrollback"),
+                    "lines": scrolls[index].result(),
+                }
+            ]
+            agent = agents[index].result() if agents[index] else None
+            if agent and found is None:
+                found = transcripts_for([future.result() if future else None for future in agents])
+            path = found.get(index) if agent else None
+            if path:
+                buffers.append(
+                    {
+                        "kind": "agent",
+                        "label": label_for(pane, agent["agent"]),
+                        "title": f"{pane_title(pane, agent['agent'])} · {path}",
+                        "lines": render(agent["agent"], read_records(path))[-max_lines:],
+                    }
+                )
+            for buffer in buffers:
+                buffer.update(id=next_id, pane=pane, proximity=pane["proximity"], label=buffer["label"].ljust(width))
+                next_id += 1
+            yield list(write_buffers(directory, buffers))
+    finally:
+        # A picker closed early shouldn't wait for the calls still running.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def transcripts_for(agents):
+    """Each agent's transcript, keyed by its index in AGENTS, where None marks a pane without one."""
+    for index, agent in enumerate(agents):
         if agent:
             agent["key"] = index
-    found = assign_transcripts([agent for _, _, agent in collected if agent]) if transcripts else {}
-    meta = {}
-    buffers = []
-    for index, (pane, lines, agent) in enumerate(collected):
-        scroll_id = len(buffers)
-        buffers.append(
-            {
-                "id": scroll_id,
-                "pane": pane,
-                "kind": "scroll",
-                "label": label_for(pane, "scroll"),
-                "title": pane_title(pane, "scrollback"),
-                "lines": lines,
-                "proximity": pane["proximity"],
-            }
-        )
-        path = found.get(index) if agent else None
-        if path:
-            agent_lines = render(agent["agent"], read_records(path))[-max_lines:]
-            buffers.append(
-                {
-                    "id": len(buffers),
-                    "pane": pane,
-                    "kind": "agent",
-                    "label": label_for(pane, agent["agent"]),
-                    "title": f"{pane_title(pane, agent['agent'])} · {path}",
-                    "lines": agent_lines,
-                    "proximity": pane["proximity"],
-                }
-            )
-    for buffer in buffers:
-        meta[str(buffer["id"])] = {"pane": buffer["pane"], "kind": buffer["kind"]}
-    with open(os.path.join(directory, "buffers.json"), "w", encoding="utf-8") as out:
-        json.dump(meta, out)
-    width = max((len(buffer["label"]) for buffer in buffers), default=0)
-    for buffer in buffers:
-        buffer["label"] = buffer["label"].ljust(width)
-    yield from write_buffers(directory, buffers)
+    return assign_transcripts([agent for agent in agents if agent])
 
 
 def read_state(directory):
@@ -577,7 +597,7 @@ def pick(options):
     try:
         write_state(directory, {"scope": options.scope, "source": options.source})
         state = read_state(directory)
-        panes = terminal_blocks(options.session, options.block)
+        # fzf opens first and shows its spinner while the rows come in.
         fzf = subprocess.Popen(
             fzf_command(options, directory),
             stdin=subprocess.PIPE,
@@ -585,17 +605,25 @@ def pick(options):
             text=True,
             env=fzf_env(options),
         )
-        with open(os.path.join(directory, "rows.tsv"), "w", encoding="utf-8") as rows:
-            try:
-                for row in build(directory, panes, options.max_lines, options.transcripts):
-                    rows.write(row + "\n")
-                    if keep(row, state):
-                        fzf.stdin.write(row + "\n")
-            except BrokenPipeError:
-                pass
+        try:
+            with open(os.path.join(directory, "rows.tsv"), "w", encoding="utf-8") as rows:
+                panes = terminal_blocks(options.session, options.block)
+                with contextlib.closing(build(directory, panes, options.max_lines, options.transcripts)) as chunks:
+                    for chunk in chunks:
+                        rows.writelines(row + "\n" for row in chunk)
+                        fzf.stdin.writelines(row + "\n" for row in chunk if keep(row, state))
+                        fzf.stdin.flush()
+        except BrokenPipeError:
+            pass
+        except BaseException:
+            # SIGTERM lets fzf restore the terminal before the error shows.
+            fzf.terminate()
+            fzf.wait()
+            raise
         with contextlib.suppress(BrokenPipeError):
             fzf.stdin.close()
-        output = fzf.stdout.read()
+        with fzf.stdout:
+            output = fzf.stdout.read()
         if fzf.wait() not in (0, 1, 130):
             raise RuntimeError(f"fzf failed with status {fzf.returncode}")
         lines = output.split("\n")
@@ -603,8 +631,8 @@ def pick(options):
             return 0
         key, row = lines[0], lines[1]
         buffer, line, _, _, _, text = row.split("\t", 5)
-        with open(os.path.join(directory, "buffers.json"), encoding="utf-8") as source:
-            pane = json.load(source)[buffer]["pane"]
+        with open(os.path.join(directory, f"{int(buffer)}.json"), encoding="utf-8") as source:
+            pane = json.load(source)["pane"]
         if key == "ctrl-y":
             copy(text, options.clip_tool)
         elif key in ("alt-enter", "ctrl-o"):

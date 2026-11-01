@@ -10,7 +10,8 @@ Fuzzy search over every Rex pane's scrollback and agent transcript. See `README.
 
 ## Behavior to keep
 
-- Each run writes its buffers to a private temporary directory, removed when the picker exits. A buffer file's first line is its title; its lines follow, so buffer line N is file line N+1.
+- Each run writes its buffers to a private temporary directory, removed when the picker exits. A buffer file's first line is its title; its lines follow, so buffer line N is file line N+1. Each buffer `ID.txt` has its pane in `ID.json`.
+- fzf opens before any `rex` call, and `build` streams rows pane by pane, nearest first, with every `rex` call in flight at once. Labels are padded to a width known from the pane list alone, so a new source name must go in `SOURCE_NAMES`.
 - A row is `buffer, line, proximity, source, label, text`, tab-separated. fzf shows fields 5 and 6 and searches only field 6; keep `--with-nth` and `--nth` in step with the row.
 - Agent detection follows Agentmux's `processAgent` and `blockAgent` (`agentmux/src/rex.mjs` in the dotfiles); keep them in step.
 - Transcript matching is a best guess: an explicit conversation on the command line, else the agent's directory and start time. Don't read other programs' state to do it.
